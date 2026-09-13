@@ -1,0 +1,30 @@
+name: Weekly Trade
+
+on:
+  schedule:
+    # Runs every Monday at 9:00 AM UTC — adjust the cron as needed
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+jobs:
+  run-trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run weekly trade script
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+        run: python weekly_trade.py
