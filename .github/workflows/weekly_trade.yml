@@ -25,6 +25,7 @@ jobs:
 
       - name: Run weekly trade script
         env:
-          API_KEY: ${{ secrets.API_KEY }}
-          API_SECRET: ${{ secrets.API_SECRET }}
+      env:
+  ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+  ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python main.py
