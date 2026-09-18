@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 from alpaca.trading.client import TradingClient
@@ -9,6 +10,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 # ==========================================
 # 1. CONFIGURATION & CREDENTIALS
@@ -42,7 +44,6 @@ data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 # ==========================================
 def calc_composer_rsi10(series: pd.Series, window: int = 10) -> pd.Series:
     """Calculates RSI using a Simple Moving Average (SMA) of gains/losses
-
     (Matches Composer's standard rolling window engine).
     """
     delta = series.diff()
@@ -60,15 +61,21 @@ def calc_composer_rsi10(series: pd.Series, window: int = 10) -> pd.Series:
 
 
 # ==========================================
-# 3. MARKET DATA FETCHING
+# 3. MARKET DATA FETCHING (UPDATED)
 # ==========================================
 def get_market_data(tickers: list[str]) -> pd.DataFrame:
     """Fetches historical daily close prices required for 200 SMA calculation."""
+    # Set explicit start date ~365 calendar days ago to guarantee >200 trading days
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=365)
+
     try:
         request_params = StockBarsRequest(
             symbol_or_symbols=tickers,
             timeframe=TimeFrame.Day,
-            limit=250
+            start=start_dt,
+            end=end_dt,
+            feed=DataFeed.IEX  # Explicitly set feed type to avoid data source drops
         )
         bars = data_client.get_stock_bars(request_params).df
     except Exception as e:
@@ -81,6 +88,9 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
 
     # Pivot dataframe so columns are ticker close prices indexed by timestamp
     df = bars.reset_index().pivot(index='timestamp', columns='symbol', values='close')
+
+    # Forward fill to handle any isolated missing trading days per ticker
+    df = df.ffill()
 
     # Data integrity validation
     missing = [t for t in tickers if t not in df.columns]
@@ -217,11 +227,6 @@ def rebalance(target_ticker: str):
         print(f"ERROR: Failed to check open orders: {e}")
         sys.exit(1)
 
-    # Capture cash BEFORE liquidating anything, so there's a real baseline
-    # to compare against once liquidations settle. Without this baseline,
-    # a polling loop that only checks "is cash > 0" can exit on the very
-    # first check just because the account had a few stray dollars sitting
-    # idle -- long before the sale proceeds actually land.
     try:
         cash_before = float(trading_client.get_account().cash)
     except Exception as e:
@@ -251,10 +256,7 @@ def rebalance(target_ticker: str):
         print("ERROR: One or more liquidations failed or timed out. Aborting before entering a new position.")
         sys.exit(1)
 
-    # Step 2: Poll cash balance until it actually reflects the liquidation
-    # proceeds (i.e. has risen above the pre-liquidation baseline), not
-    # just until it happens to be nonzero. If nothing was liquidated this
-    # run, there's nothing to wait for -- skip straight to using cash_before.
+    # Step 2: Poll cash balance until it reflects liquidation proceeds
     available_cash = cash_before
     if had_liquidations:
         for attempt in range(10):
