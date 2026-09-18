@@ -3,7 +3,7 @@ name: Composer Daily Trade
 on:
   schedule:
     # Runs daily at 3:30 PM UTC
-    - cron: '30 15 * * *'
+    - cron: '30 19 * * *'
   workflow_dispatch: {}  # Allows manual triggers from GitHub UI
 
 jobs:
