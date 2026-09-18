@@ -1,4 +1,6 @@
-
+import sys
+import os
+os.environ["PYTHONUNBUFFERED"] = "1"
 import os
 import sys
 import time
