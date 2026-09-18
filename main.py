@@ -3,10 +3,17 @@ import sys
 import numpy as np
 import pandas as pd
 from datetime import datetime
+
+# Data imports
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
+
+# Trading imports
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ==========================================
 # 1. API SETUP
@@ -14,11 +21,16 @@ from alpaca.data.enums import DataFeed
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
+# Set to True for Paper Trading, False for Live Trading
+PAPER_TRADING = True 
+
 if not API_KEY or not SECRET_KEY:
     print("ERROR: Missing Alpaca credentials.")
     sys.exit(1)
 
+# Client initialization
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_TRADING)
 
 INDICATOR_SYMBOL = "QQQ"
 TRADE_SYMBOL = "TQQQ"
@@ -50,7 +62,7 @@ def fetch_weekly_bars(symbol: str, start_dt: datetime, end_dt: datetime) -> pd.D
 
 
 # ==========================================
-# 3. INDICATOR LOGIC (Wilder's Smoothing RSI, matches live script)
+# 3. INDICATOR LOGIC
 # ==========================================
 def calc_wilder_rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
@@ -60,7 +72,6 @@ def calc_wilder_rsi(series: pd.Series, window: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / window, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / window, adjust=False).mean()
 
-    # Zero-loss protection: avg_loss == 0 means RSI should be 100, not NaN
     rs = avg_gain / avg_loss.replace(0, np.inf)
     rsi = 100 - (100 / (1 + rs))
     rsi[avg_loss == 0] = 100.0
@@ -69,9 +80,6 @@ def calc_wilder_rsi(series: pd.Series, window: int = 14) -> pd.Series:
 
 # ==========================================
 # 4. SIGNAL LOGIC
-# NOTE: this must exactly match the live script's buy_cond / sell_cond.
-# If you change the live logic, update this function too -- a backtest
-# is only meaningful if it evaluates the strategy that's actually trading.
 # ==========================================
 def generate_signal(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA12"] = df["close"].ewm(span=12, adjust=False).mean()
@@ -84,9 +92,6 @@ def generate_signal(df: pd.DataFrame) -> pd.DataFrame:
     trend_bullish = df["EMA12"] > df["EMA26"]
     overbought = df["RSI"] >= 70
 
-    # Mutually exclusive, matches the patched live script:
-    #   buy  = momentum bullish AND trend bullish
-    #   sell = trend flips bearish, OR momentum rolls over while overbought
     buy_cond = macd_bullish & trend_bullish
     sell_cond = (~trend_bullish) | (overbought & ~macd_bullish)
 
@@ -94,102 +99,93 @@ def generate_signal(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[buy_cond, "signal"] = 1
     df.loc[sell_cond, "signal"] = 0
 
-    # Shift by 1 bar: a signal computed from this week's close can only be
-    # acted on starting next week, avoiding lookahead bias.
     df["position"] = df["signal"].ffill().shift(1).fillna(0)
     return df
 
 
 # ==========================================
-# 5. PERFORMANCE STATS
+# 5. LIVE ORDER EXECUTION LOGIC
 # ==========================================
-def compute_stats(returns: pd.Series) -> dict:
-    """Computes cumulative return and max drawdown for a return series."""
-    returns = returns.dropna()
-    if returns.empty:
-        return {"total_return": np.nan, "max_drawdown": np.nan}
+def execute_live_trade(latest_signal: float):
+    """
+    Checks current portfolio holdings and places buy/sell orders 
+    to match the latest signal state.
+    """
+    print("\n================ LIVE EXECUTION ================")
+    
+    # 1. Fetch current position for TRADE_SYMBOL
+    current_qty = 0
+    try:
+        position = trading_client.get_open_position(TRADE_SYMBOL)
+        current_qty = float(position.qty)
+        print(f"Current Position: {current_qty} shares of {TRADE_SYMBOL}")
+    except Exception:
+        print(f"Current Position: 0 shares of {TRADE_SYMBOL}")
 
-    equity_curve = (1 + returns).cumprod()
-    total_return = equity_curve.iloc[-1] - 1
+    # 2. Check current account buying power
+    account = trading_client.get_account()
+    cash_available = float(account.cash)
+    print(f"Available Cash: ${cash_available:,.2f}")
 
-    running_max = equity_curve.cummax()
-    drawdown = (equity_curve / running_max) - 1
-    max_drawdown = drawdown.min()
+    # 3. Decision Logic based on signal (1 = Buy/Hold, 0 = Sell/Flat)
+    if latest_signal == 1 and current_qty == 0:
+        print(f"SIGNAL: BUY detected for {TRADE_SYMBOL}.")
+        
+        # Use 95% of available cash to prevent rounding/margin overflow errors
+        allocation = cash_available * 0.95
+        
+        if allocation > 10:  # Minimum dollar amount check
+            order_data = MarketOrderRequest(
+                symbol=TRADE_SYMBOL,
+                notional=round(allocation, 2),  # Places order in dollar amount
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.GTC
+            )
+            order = trading_client.submit_order(order_data)
+            print(f"SUCCESS: Submitted BUY order for ${allocation:,.2f} of {TRADE_SYMBOL}. Order ID: {order.id}")
+        else:
+            print("WARNING: Insufficient funds to execute BUY order.")
 
-    return {"total_return": total_return, "max_drawdown": max_drawdown}
+    elif latest_signal == 0 and current_qty > 0:
+        print(f"SIGNAL: SELL detected for {TRADE_SYMBOL}.")
+        
+        # Close the active position
+        trading_client.close_position(TRADE_SYMBOL)
+        print(f"SUCCESS: Submitted Liquidate/SELL order for all shares of {TRADE_SYMBOL}.")
+
+    else:
+        print(f"NO CHANGE REQUIRED. Signal is {int(latest_signal) if not np.isnan(latest_signal) else 0} and current position is {current_qty} shares.")
+
+    print("==================================================")
 
 
 # ==========================================
-# 6. MAIN BACKTEST RUNNER
+# 6. MAIN RUNNER
 # ==========================================
-def run_backtest():
+def main():
     start_dt = datetime(2018, 1, 1)
     end_dt = datetime.now()
 
-    print("Fetching historical market data for backtest...")
+    print("Fetching historical market data...")
     qqq_df = fetch_weekly_bars(INDICATOR_SYMBOL, start_dt, end_dt)
-    tqqq_df = fetch_weekly_bars(TRADE_SYMBOL, start_dt, end_dt)
 
-    MIN_BARS = 104  # ~2 years of weekly bars, enough for EMA26/RSI14 to converge
+    MIN_BARS = 104
     if len(qqq_df) < MIN_BARS:
         print(f"ERROR: Insufficient {INDICATOR_SYMBOL} history ({len(qqq_df)} rows). Need at least {MIN_BARS}.")
         sys.exit(1)
 
+    # Generate strategy signals
     qqq_df = generate_signal(qqq_df)
 
-    # Trade-side returns
-    tqqq_df["pct_change"] = tqqq_df["close"].pct_change()
+    # Get the latest generated signal (1 = Buy, 0 = Sell)
+    # Note: Using .iloc[-1]["signal"] gets the immediate un-shifted signal for current bar execution
+    latest_signal = qqq_df["signal"].dropna().iloc[-1]
+    
+    print(f"Latest calculated signal for {INDICATOR_SYMBOL}: {latest_signal}")
 
-    # Merge strategy position onto TQQQ returns
-    combined = tqqq_df.join(qqq_df[["position"]])
-
-    # Guard against silent misalignment between the two symbols' bars.
-    # A plain .prod() on a series with NaNs silently skips them, which
-    # would understate how many weeks actually went into the result
-    # without any warning.
-    n_before = len(combined)
-    combined = combined.dropna(subset=["position", "pct_change"])
-    n_dropped = n_before - len(combined)
-    if n_dropped > 0:
-        print(f"WARNING: dropped {n_dropped} misaligned/NaN row(s) between {INDICATOR_SYMBOL} and {TRADE_SYMBOL} before computing returns.")
-
-    combined["strat_return"] = combined["position"] * combined["pct_change"]
-
-    # Turnover: count how many times position actually changed (entries + exits)
-    position_changes = combined["position"].diff().fillna(0) != 0
-    total_trades = int(position_changes.sum())
-
-    # ==========================================
-    # 7. WINDOWED PERFORMANCE: YTD and Since-2020
-    # NOTE: figures below are frictionless (no spread, slippage, or
-    # commission costs applied) -- treat them as a best-case upper bound,
-    # not a realistic forward expectation.
-    # ==========================================
-    current_year = datetime.now().year
-    windows = {
-        f"YTD ({current_year})": combined[combined.index.year == current_year],
-        "2020 to Present": combined[combined.index.year >= 2020],
-    }
-
-    print("\n================ BACKTEST RESULTS ================")
-    print("(Frictionless: excludes spread, slippage, and commissions)\n")
-
-    for label, window_df in windows.items():
-        strat_stats = compute_stats(window_df["strat_return"])
-        bench_stats = compute_stats(window_df["pct_change"])
-        window_trades = int((window_df["position"].diff().fillna(0) != 0).sum())
-
-        print(f"--- {label} ---")
-        print(f"  Strategy Return:        {strat_stats['total_return'] * 100:6.2f}%")
-        print(f"  Strategy Max Drawdown:  {strat_stats['max_drawdown'] * 100:6.2f}%")
-        print(f"  Buy & Hold {TRADE_SYMBOL} Return: {bench_stats['total_return'] * 100:6.2f}%")
-        print(f"  Buy & Hold Max Drawdown:{bench_stats['max_drawdown'] * 100:6.2f}%")
-        print(f"  Position Changes:       {window_trades}")
-        print()
-
-    print(f"Total position changes over full backtest window: {total_trades}")
-    print("==================================================")
+    # Execute trade logic based on the latest signal
+    execute_live_trade(latest_signal)
 
 
 if __name__ == "__main__":
-    run_backtest()
+    main()
