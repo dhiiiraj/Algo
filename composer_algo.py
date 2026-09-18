@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
