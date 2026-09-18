@@ -61,13 +61,13 @@ def calc_composer_rsi10(series: pd.Series, window: int = 10) -> pd.Series:
 
 
 # ==========================================
-# 3. MARKET DATA FETCHING (UPDATED)
+# 3. MARKET DATA FETCHING (PAGINATED & BULK FIX)
 # ==========================================
 def get_market_data(tickers: list[str]) -> pd.DataFrame:
     """Fetches historical daily close prices required for 200 SMA calculation."""
-    # Set explicit start date ~365 calendar days ago to guarantee >200 trading days
     end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=365)
+    # 400 calendar days gives enough padding for holidays/weekends to get >= 250 trading bars
+    start_dt = end_dt - timedelta(days=400)
 
     try:
         request_params = StockBarsRequest(
@@ -75,9 +75,12 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
             timeframe=TimeFrame.Day,
             start=start_dt,
             end=end_dt,
-            feed=DataFeed.IEX  # Explicitly set feed type to avoid data source drops
+            limit=2000,          # High limit to fetch all multi-ticker bars in minimal calls
+            feed=DataFeed.IEX   # Use DataFeed.SIP if you have a paid Alpaca data subscription
         )
-        bars = data_client.get_stock_bars(request_params).df
+        # get_stock_bars returns a BarSet that handles pagination automatically under the hood
+        barset = data_client.get_stock_bars(request_params)
+        bars = barset.df
     except Exception as e:
         print(f"ERROR: Failed to fetch market data from Alpaca API: {e}")
         sys.exit(1)
@@ -89,8 +92,8 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
     # Pivot dataframe so columns are ticker close prices indexed by timestamp
     df = bars.reset_index().pivot(index='timestamp', columns='symbol', values='close')
 
-    # Forward fill to handle any isolated missing trading days per ticker
-    df = df.ffill()
+    # Forward-fill any missing candles across symbols
+    df = df.ffill().dropna()
 
     # Data integrity validation
     missing = [t for t in tickers if t not in df.columns]
