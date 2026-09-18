@@ -61,12 +61,11 @@ def calc_composer_rsi10(series: pd.Series, window: int = 10) -> pd.Series:
 
 
 # ==========================================
-# 3. MARKET DATA FETCHING (PAGINATED & BULK FIX)
+# 3. MARKET DATA FETCHING (TIMESTAMP ALIGNMENT FIX)
 # ==========================================
 def get_market_data(tickers: list[str]) -> pd.DataFrame:
     """Fetches historical daily close prices required for 200 SMA calculation."""
     end_dt = datetime.now()
-    # 400 calendar days gives enough padding for holidays/weekends to get >= 250 trading bars
     start_dt = end_dt - timedelta(days=400)
 
     try:
@@ -75,10 +74,8 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
             timeframe=TimeFrame.Day,
             start=start_dt,
             end=end_dt,
-            limit=2000,          # High limit to fetch all multi-ticker bars in minimal calls
-            feed=DataFeed.IEX   # Use DataFeed.SIP if you have a paid Alpaca data subscription
+            feed=DataFeed.IEX
         )
-        # get_stock_bars returns a BarSet that handles pagination automatically under the hood
         barset = data_client.get_stock_bars(request_params)
         bars = barset.df
     except Exception as e:
@@ -89,10 +86,21 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
         print("ERROR: No market data returned for any ticker.")
         sys.exit(1)
 
-    # Pivot dataframe so columns are ticker close prices indexed by timestamp
-    df = bars.reset_index().pivot(index='timestamp', columns='symbol', values='close')
+    # 1. Reset index to extract symbol and timestamp columns
+    bars_reset = bars.reset_index()
 
-    # Forward-fill any missing candles across symbols
+    # 2. Normalize timestamps to calendar dates (removes time-of-day mismatch across symbols)
+    bars_reset['date'] = pd.to_datetime(bars_reset['timestamp']).dt.date
+
+    # 3. Pivot using calendar date index instead of exact timestamp
+    df = bars_reset.pivot_table(
+        index='date', 
+        columns='symbol', 
+        values='close', 
+        aggfunc='last'
+    )
+
+    # 4. Fill missing dates (e.g., lower volume days for niche ETFs) then drop setup NaNs
     df = df.ffill().dropna()
 
     # Data integrity validation
@@ -106,7 +114,6 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
         sys.exit(1)
 
     return df
-
 
 # ==========================================
 # 4. COMPOSER SIGNAL ENGINE
