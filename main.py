@@ -16,19 +16,20 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ==========================================
-# 1. API SETUP
+# 1. API & STRATEGY CONFIGURATION
 # ==========================================
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-# Set to True for Paper Trading, False for Live Trading
 PAPER_TRADING = True 
+
+# Set your fixed starting cash investment here:
+INITIAL_INVESTMENT = 100.0  # Dollars
 
 if not API_KEY or not SECRET_KEY:
     print("ERROR: Missing Alpaca credentials.")
     sys.exit(1)
 
-# Client initialization
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_TRADING)
 
@@ -99,7 +100,6 @@ def generate_signal(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[buy_cond, "signal"] = 1
     df.loc[sell_cond, "signal"] = 0
 
-    df["position"] = df["signal"].ffill().shift(1).fillna(0)
     return df
 
 
@@ -107,13 +107,9 @@ def generate_signal(df: pd.DataFrame) -> pd.DataFrame:
 # 5. LIVE ORDER EXECUTION LOGIC
 # ==========================================
 def execute_live_trade(latest_signal: float):
-    """
-    Checks current portfolio holdings and places buy/sell orders 
-    to match the latest signal state.
-    """
     print("\n================ LIVE EXECUTION ================")
     
-    # 1. Fetch current position for TRADE_SYMBOL
+    # 1. Fetch current open position for TRADE_SYMBOL
     current_qty = 0
     try:
         position = trading_client.get_open_position(TRADE_SYMBOL)
@@ -127,34 +123,42 @@ def execute_live_trade(latest_signal: float):
     cash_available = float(account.cash)
     print(f"Available Cash: ${cash_available:,.2f}")
 
-    # 3. Decision Logic based on signal (1 = Buy/Hold, 0 = Sell/Flat)
+    # 3. Decision Logic
     if latest_signal == 1 and current_qty == 0:
         print(f"SIGNAL: BUY detected for {TRADE_SYMBOL}.")
         
-        # Use 95% of available cash to prevent rounding/margin overflow errors
-        allocation = cash_available * 0.95
-        
-        if allocation > 10:  # Minimum dollar amount check
+        # LOGIC FOR INITIAL vs REINVESTMENT:
+        # If available cash is greater than or equal to INITIAL_INVESTMENT, 
+        # use the INITIAL_INVESTMENT amount.
+        # If available cash is less (e.g., after a previous cycle or lower balance), 
+        # invest all available cash (with 95% safety buffer).
+        if cash_available >= INITIAL_INVESTMENT:
+            trade_amount = INITIAL_INVESTMENT
+            print(f"Using initial configured amount: ${trade_amount:,.2f}")
+        else:
+            trade_amount = cash_available * 0.95
+            print(f"Reinvesting accumulated cash: ${trade_amount:,.2f}")
+
+        if trade_amount >= 10:  # Minimum execution threshold
             order_data = MarketOrderRequest(
                 symbol=TRADE_SYMBOL,
-                notional=round(allocation, 2),  # Places order in dollar amount
+                notional=round(trade_amount, 2),
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.GTC
             )
             order = trading_client.submit_order(order_data)
-            print(f"SUCCESS: Submitted BUY order for ${allocation:,.2f} of {TRADE_SYMBOL}. Order ID: {order.id}")
+            print(f"SUCCESS: Submitted BUY order for ${trade_amount:,.2f} of {TRADE_SYMBOL}. Order ID: {order.id}")
         else:
-            print("WARNING: Insufficient funds to execute BUY order.")
+            print("ERROR: Insufficient cash balance to place buy order.")
 
     elif latest_signal == 0 and current_qty > 0:
         print(f"SIGNAL: SELL detected for {TRADE_SYMBOL}.")
-        
-        # Close the active position
+        # Liquidate full position; initial capital + profits convert back to cash
         trading_client.close_position(TRADE_SYMBOL)
-        print(f"SUCCESS: Submitted Liquidate/SELL order for all shares of {TRADE_SYMBOL}.")
+        print(f"SUCCESS: Liquidated all shares of {TRADE_SYMBOL}. Capital + returns saved to cash for reinvestment.")
 
     else:
-        print(f"NO CHANGE REQUIRED. Signal is {int(latest_signal) if not np.isnan(latest_signal) else 0} and current position is {current_qty} shares.")
+        print(f"NO ACTION: Signal is {int(latest_signal) if not np.isnan(latest_signal) else 0} and current position is {current_qty} shares.")
 
     print("==================================================")
 
@@ -169,21 +173,14 @@ def main():
     print("Fetching historical market data...")
     qqq_df = fetch_weekly_bars(INDICATOR_SYMBOL, start_dt, end_dt)
 
-    MIN_BARS = 104
-    if len(qqq_df) < MIN_BARS:
-        print(f"ERROR: Insufficient {INDICATOR_SYMBOL} history ({len(qqq_df)} rows). Need at least {MIN_BARS}.")
+    if len(qqq_df) < 104:
+        print("ERROR: Insufficient historical data.")
         sys.exit(1)
 
-    # Generate strategy signals
     qqq_df = generate_signal(qqq_df)
-
-    # Get the latest generated signal (1 = Buy, 0 = Sell)
-    # Note: Using .iloc[-1]["signal"] gets the immediate un-shifted signal for current bar execution
     latest_signal = qqq_df["signal"].dropna().iloc[-1]
-    
-    print(f"Latest calculated signal for {INDICATOR_SYMBOL}: {latest_signal}")
 
-    # Execute trade logic based on the latest signal
+    print(f"Latest signal for {INDICATOR_SYMBOL}: {latest_signal}")
     execute_live_trade(latest_signal)
 
 
