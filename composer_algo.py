@@ -92,16 +92,48 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
     # 2. Normalize timestamps to calendar dates (removes time-of-day mismatch across symbols)
     bars_reset['date'] = pd.to_datetime(bars_reset['timestamp']).dt.date
 
+    # DIAGNOSTIC: per-symbol row counts and date ranges, printed before any
+    # NaN handling. If one ticker is sparse or missing, this reveals it --
+    # a bare "N rows" failure downstream doesn't say WHICH ticker caused it.
+    print("Per-symbol bar coverage in this window:")
+    coverage = bars_reset.groupby('symbol')['date'].agg(count='count', first='min', last='max')
+    for symbol, row in coverage.iterrows():
+        print(f"  {symbol}: {row['count']} bars, {row['first']} to {row['last']}")
+
+    missing = [t for t in tickers if t not in coverage.index]
+    if missing:
+        print(f"ERROR: No data returned at all for ticker(s): {missing}")
+        sys.exit(1)
+
     # 3. Pivot using calendar date index instead of exact timestamp
     df = bars_reset.pivot_table(
-        index='date', 
-        columns='symbol', 
-        values='close', 
+        index='date',
+        columns='symbol',
+        values='close',
         aggfunc='last'
     )
 
-    # 4. Fill missing dates (e.g., lower volume days for niche ETFs) then drop setup NaNs
-    df = df.ffill().dropna()
+    # 4. Restrict to the date range where EVERY ticker actually has data,
+    # rather than forward-filling across large gaps. A ticker that starts
+    # late (or is missing most of the window) should shrink the usable
+    # window, not get silently papered over -- ffill() can only fill
+    # forward from a value that exists, so any large gap at the START of
+    # a column stays NaN, and a blanket dropna() then wipes out every row
+    # before the LAST ticker's first valid date. That's what collapsed
+    # the frame down to a single row.
+    first_valid_per_symbol = df.apply(lambda col: col.first_valid_index())
+    if first_valid_per_symbol.isna().any():
+        bad = first_valid_per_symbol[first_valid_per_symbol.isna()].index.tolist()
+        print(f"ERROR: Ticker(s) with zero valid close prices in this window: {bad}")
+        sys.exit(1)
+
+    common_start = max(first_valid_per_symbol)
+    df = df.loc[df.index >= common_start]
+
+    # Now forward-fill only small gaps (e.g. a single low-volume day for a
+    # niche ETF), capped at 3 consecutive days, so a genuinely broken or
+    # delisted feed doesn't get silently smoothed over indefinitely.
+    df = df.ffill(limit=3)
 
     # Data integrity validation
     missing = [t for t in tickers if t not in df.columns]
@@ -109,11 +141,18 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
         print(f"ERROR: No data returned for ticker(s): {missing}")
         sys.exit(1)
 
+    remaining_nan_cols = df.columns[df.isna().any()].tolist()
+    if remaining_nan_cols:
+        print(f"ERROR: Gaps longer than 3 days remain in: {remaining_nan_cols}. Refusing to proceed on stale/interpolated data.")
+        sys.exit(1)
+
     if len(df) < MIN_ROWS:
         print(f"ERROR: Insufficient price history returned ({len(df)} rows). Need at least {MIN_ROWS}.")
+        print(f"Common start date across all tickers was {common_start} -- check the per-symbol coverage above for the cause.")
         sys.exit(1)
 
     return df
+
 
 # ==========================================
 # 4. COMPOSER SIGNAL ENGINE
