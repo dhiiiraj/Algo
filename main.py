@@ -1,118 +1,195 @@
 import os
 import sys
-from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
-
+from datetime import datetime
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+
+# ==========================================
+# 1. API SETUP
+# ==========================================
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+if not API_KEY or not SECRET_KEY:
+    print("ERROR: Missing Alpaca credentials.")
+    sys.exit(1)
+
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+INDICATOR_SYMBOL = "QQQ"
+TRADE_SYMBOL = "TQQQ"
 
 
-def run_strategy():
-    # 1. Fetch API Credentials from Environment Variables
-    API_KEY = os.environ.get("ALPACA_API_KEY")
-    SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-
-    if not API_KEY or not SECRET_KEY:
-        print("ERROR: Missing Alpaca API credentials.")
-        print("Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in GitHub Secrets.")
-        sys.exit(1)
-
-    print("Authenticating with Alpaca API (Paper Environment)...")
-    trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-    data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-
-    # 2. Fetch Weekly QQQ Data for Signal Generation (1 Year History)
-    INDICATOR_SYMBOL = "QQQ"
-    TRADE_SYMBOL = "TQQQ"
-    
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=365)
-
-    print(f"Fetching weekly {INDICATOR_SYMBOL} bar data for indicator generation...")
-    request_params = StockBarsRequest(
-        symbol_or_symbols=INDICATOR_SYMBOL,
-        timeframe=TimeFrame.Week,
-        start=start_dt,
-        end=end_dt,
-        feed=DataFeed.IEX  # Explicitly set free IEX data feed
-    )
-
+# ==========================================
+# 2. DATA FETCHING
+# ==========================================
+def fetch_weekly_bars(symbol: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    """Fetches weekly bars for a symbol and returns a clean, symbol-indexed DataFrame."""
     try:
-        bars = data_client.get_stock_bars(request_params)
-        df = bars.df.loc[INDICATOR_SYMBOL].copy()
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Week,
+            start=start_dt,
+            end=end_dt,
+            feed=DataFeed.IEX
+        )
+        bars = data_client.get_stock_bars(request)
     except Exception as e:
-        print(f"ERROR: Failed to fetch market data from Alpaca API: {e}")
+        print(f"ERROR: Failed to fetch {symbol} data from Alpaca API: {e}")
         sys.exit(1)
 
-    if df.empty or len(df) < 26:
-        print(f"ERROR: Insufficient price history returned ({len(df)} rows). Need at least 26 weeks.")
+    if symbol not in bars.df.index.get_level_values(0):
+        print(f"ERROR: No data returned for {symbol}.")
         sys.exit(1)
 
-    # 3. Calculate Indicators on QQQ using Standard Wilder's Smoothing
+    return bars.df.loc[symbol].copy()
+
+
+# ==========================================
+# 3. INDICATOR LOGIC (Wilder's Smoothing RSI, matches live script)
+# ==========================================
+def calc_wilder_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.ewm(alpha=1 / window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / window, adjust=False).mean()
+
+    # Zero-loss protection: avg_loss == 0 means RSI should be 100, not NaN
+    rs = avg_gain / avg_loss.replace(0, np.inf)
+    rsi = 100 - (100 / (1 + rs))
+    rsi[avg_loss == 0] = 100.0
+    return rsi
+
+
+# ==========================================
+# 4. SIGNAL LOGIC
+# NOTE: this must exactly match the live script's buy_cond / sell_cond.
+# If you change the live logic, update this function too -- a backtest
+# is only meaningful if it evaluates the strategy that's actually trading.
+# ==========================================
+def generate_signal(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA12"] = df["close"].ewm(span=12, adjust=False).mean()
     df["EMA26"] = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = df["EMA12"] - df["EMA26"]
     df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["RSI"] = calc_wilder_rsi(df["close"], window=14)
 
-    # Wilder's Smoothing RSI Calculation (Standard Charting Method)
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
+    macd_bullish = df["MACD"] > df["MACD_Signal"]
+    trend_bullish = df["EMA12"] > df["EMA26"]
+    overbought = df["RSI"] >= 70
 
-    # Wilder's exponential moving average uses alpha = 1 / 14
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    # Mutually exclusive, matches the patched live script:
+    #   buy  = momentum bullish AND trend bullish
+    #   sell = trend flips bearish, OR momentum rolls over while overbought
+    buy_cond = macd_bullish & trend_bullish
+    sell_cond = (~trend_bullish) | (overbought & ~macd_bullish)
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
+    df["signal"] = np.nan
+    df.loc[buy_cond, "signal"] = 1
+    df.loc[sell_cond, "signal"] = 0
 
-    # 4. Determine Trade Signal from QQQ Indicators
-    latest = df.iloc[-1]
-    
-    buy_cond = (latest["MACD"] > latest["MACD_Signal"]) or (latest["EMA12"] > latest["EMA26"])
-    sell_cond = (latest["EMA26"] > latest["EMA12"]) or (
-        (latest["RSI"] >= 70) and ((latest["MACD"] < latest["MACD_Signal"]) or (latest["EMA26"] > latest["EMA12"]))
-    )
+    # Shift by 1 bar: a signal computed from this week's close can only be
+    # acted on starting next week, avoiding lookahead bias.
+    df["position"] = df["signal"].ffill().shift(1).fillna(0)
+    return df
 
-    print(f"Weekly QQQ Indicators -> MACD: {latest['MACD']:.2f} | Signal: {latest['MACD_Signal']:.2f} | RSI (Wilder): {latest['RSI']:.2f}")
 
-    # 5. Check Portfolio Holdings & Execute Rebalance on TQQQ
-    try:
-        account = trading_client.get_account()
-        positions = {p.symbol: float(p.qty) for p in trading_client.get_all_positions()}
-    except Exception as e:
-        print(f"ERROR: Failed to retrieve account status or positions: {e}")
+# ==========================================
+# 5. PERFORMANCE STATS
+# ==========================================
+def compute_stats(returns: pd.Series) -> dict:
+    """Computes cumulative return and max drawdown for a return series."""
+    returns = returns.dropna()
+    if returns.empty:
+        return {"total_return": np.nan, "max_drawdown": np.nan}
+
+    equity_curve = (1 + returns).cumprod()
+    total_return = equity_curve.iloc[-1] - 1
+
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve / running_max) - 1
+    max_drawdown = drawdown.min()
+
+    return {"total_return": total_return, "max_drawdown": max_drawdown}
+
+
+# ==========================================
+# 6. MAIN BACKTEST RUNNER
+# ==========================================
+def run_backtest():
+    start_dt = datetime(2018, 1, 1)
+    end_dt = datetime.now()
+
+    print("Fetching historical market data for backtest...")
+    qqq_df = fetch_weekly_bars(INDICATOR_SYMBOL, start_dt, end_dt)
+    tqqq_df = fetch_weekly_bars(TRADE_SYMBOL, start_dt, end_dt)
+
+    MIN_BARS = 104  # ~2 years of weekly bars, enough for EMA26/RSI14 to converge
+    if len(qqq_df) < MIN_BARS:
+        print(f"ERROR: Insufficient {INDICATOR_SYMBOL} history ({len(qqq_df)} rows). Need at least {MIN_BARS}.")
         sys.exit(1)
 
-    tqqq_qty = positions.get(TRADE_SYMBOL, 0)
-    print(f"Current Portfolio State: {tqqq_qty} shares of {TRADE_SYMBOL}")
+    qqq_df = generate_signal(qqq_df)
 
-    if buy_cond and tqqq_qty == 0:
-        buying_power = float(account.buying_power)
-        trade_amount = round(buying_power * 0.98, 2)  # 98% cash allocation
-        print(f"SIGNAL: BUY -> Placing order for ${trade_amount:.2f} of {TRADE_SYMBOL}")
-        
-        order_data = MarketOrderRequest(
-            symbol=TRADE_SYMBOL,
-            notional=trade_amount,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-        )
-        trading_client.submit_order(order_data)
+    # Trade-side returns
+    tqqq_df["pct_change"] = tqqq_df["close"].pct_change()
 
-    elif sell_cond and tqqq_qty > 0:
-        print(f"SIGNAL: SELL -> Liquidating all {tqqq_qty} shares of {TRADE_SYMBOL}")
-        trading_client.close_position(TRADE_SYMBOL)
+    # Merge strategy position onto TQQQ returns
+    combined = tqqq_df.join(qqq_df[["position"]])
 
-    else:
-        print("SIGNAL: HOLD -> Portfolio state already matches target signal.")
+    # Guard against silent misalignment between the two symbols' bars.
+    # A plain .prod() on a series with NaNs silently skips them, which
+    # would understate how many weeks actually went into the result
+    # without any warning.
+    n_before = len(combined)
+    combined = combined.dropna(subset=["position", "pct_change"])
+    n_dropped = n_before - len(combined)
+    if n_dropped > 0:
+        print(f"WARNING: dropped {n_dropped} misaligned/NaN row(s) between {INDICATOR_SYMBOL} and {TRADE_SYMBOL} before computing returns.")
+
+    combined["strat_return"] = combined["position"] * combined["pct_change"]
+
+    # Turnover: count how many times position actually changed (entries + exits)
+    position_changes = combined["position"].diff().fillna(0) != 0
+    total_trades = int(position_changes.sum())
+
+    # ==========================================
+    # 7. WINDOWED PERFORMANCE: YTD and Since-2020
+    # NOTE: figures below are frictionless (no spread, slippage, or
+    # commission costs applied) -- treat them as a best-case upper bound,
+    # not a realistic forward expectation.
+    # ==========================================
+    current_year = datetime.now().year
+    windows = {
+        f"YTD ({current_year})": combined[combined.index.year == current_year],
+        "2020 to Present": combined[combined.index.year >= 2020],
+    }
+
+    print("\n================ BACKTEST RESULTS ================")
+    print("(Frictionless: excludes spread, slippage, and commissions)\n")
+
+    for label, window_df in windows.items():
+        strat_stats = compute_stats(window_df["strat_return"])
+        bench_stats = compute_stats(window_df["pct_change"])
+        window_trades = int((window_df["position"].diff().fillna(0) != 0).sum())
+
+        print(f"--- {label} ---")
+        print(f"  Strategy Return:        {strat_stats['total_return'] * 100:6.2f}%")
+        print(f"  Strategy Max Drawdown:  {strat_stats['max_drawdown'] * 100:6.2f}%")
+        print(f"  Buy & Hold {TRADE_SYMBOL} Return: {bench_stats['total_return'] * 100:6.2f}%")
+        print(f"  Buy & Hold Max Drawdown:{bench_stats['max_drawdown'] * 100:6.2f}%")
+        print(f"  Position Changes:       {window_trades}")
+        print()
+
+    print(f"Total position changes over full backtest window: {total_trades}")
+    print("==================================================")
 
 
 if __name__ == "__main__":
-    run_strategy()
+    run_backtest()
