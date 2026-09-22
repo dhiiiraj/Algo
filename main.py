@@ -261,7 +261,8 @@ def execute(
     target_long: bool,
     fresh_buy: bool,
     dry_run: bool,
-) -> None:
+) -> str:
+    """Places (or logs) the trade and returns a short human-readable outcome string."""
     log.info("================ EXECUTION ================")
 
     account = trading_client.get_account()
@@ -291,29 +292,33 @@ def execute(
         filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[TRADE_SYMBOL])
     )
     if open_orders:
-        log.warning(
-            "%d open %s order(s) already pending; skipping to avoid duplicates.",
-            len(open_orders), TRADE_SYMBOL,
+        msg = (
+            f"{len(open_orders)} open {TRADE_SYMBOL} order(s) already pending; "
+            "skipping to avoid duplicates."
         )
-        return
+        log.warning(msg)
+        return msg
 
     log.info("Target state: %s | fresh buy: %s", "LONG" if target_long else "FLAT", fresh_buy)
 
     # ---- BUY ----
     if target_long and qty == 0:
         if ENTER_ONLY_ON_FRESH_BUY and not fresh_buy:
-            log.info("NO ACTION: flat, state is long but not a fresh buy (ENTER_ONLY_ON_FRESH_BUY).")
-            return
+            msg = "NO ACTION: flat, state is long but not a fresh buy (ENTER_ONLY_ON_FRESH_BUY)."
+            log.info(msg)
+            return msg
 
         amount = round(deployable_cash(account), 2)
         log.info("BUY signal. Deployable cash (%.0f%%): $%.2f", CASH_DEPLOYMENT_PCT * 100, amount)
 
         if amount < MIN_TRADE_AMOUNT:
-            log.error("Trade amount $%.2f below minimum $%.2f; not buying.", amount, MIN_TRADE_AMOUNT)
-            return
+            msg = f"Trade amount ${amount:.2f} below minimum ${MIN_TRADE_AMOUNT:.2f}; not buying."
+            log.error(msg)
+            return msg
         if dry_run:
-            log.info("[DRY RUN] Would BUY $%.2f of %s.", amount, TRADE_SYMBOL)
-            return
+            msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
+            log.info(msg)
+            return msg
 
         order = trading_client.submit_order(
             MarketOrderRequest(
@@ -328,13 +333,15 @@ def execute(
             order = wait_for_order(trading_client, order)
             log.info("BUY order status: %s (filled_qty=%s)", _status(order), order.filled_qty)
         assert_order_ok(order, "BUY")
+        return f"BUY ${amount:.2f} of {TRADE_SYMBOL} | order status: {_status(order)}"
 
     # ---- SELL ----
     elif not target_long and qty > 0:
         log.info("SELL signal. Closing entire %s position (%s shares).", TRADE_SYMBOL, qty)
         if dry_run:
-            log.info("[DRY RUN] Would close position in %s.", TRADE_SYMBOL)
-            return
+            msg = f"[DRY RUN] Would close position in {TRADE_SYMBOL}."
+            log.info(msg)
+            return msg
 
         order = trading_client.close_position(TRADE_SYMBOL)
         log.info("Submitted CLOSE %s | id=%s status=%s", TRADE_SYMBOL, order.id, _status(order))
@@ -342,13 +349,50 @@ def execute(
             order = wait_for_order(trading_client, order)
             log.info("CLOSE order status: %s (filled_qty=%s)", _status(order), order.filled_qty)
         assert_order_ok(order, "CLOSE")
+        return f"SOLD entire {TRADE_SYMBOL} position ({qty} shares) | order status: {_status(order)}"
 
     # ---- HOLD ----
     else:
-        log.info(
-            "NO ACTION: target is %s and position is %s shares.",
-            "LONG" if target_long else "FLAT", qty,
-        )
+        msg = f"NO ACTION: target is {'LONG' if target_long else 'FLAT'} and position is {qty} shares."
+        log.info(msg)
+        return msg
+
+
+# ==========================================
+# 6b. EMAIL NOTIFICATION
+# ==========================================
+def send_email_report(subject: str, body: str) -> None:
+    """Sends a plain-text email via Gmail SMTP using an app password.
+
+    Required env vars:
+        GMAIL_ADDRESS       the Gmail account to send FROM (e.g. you@gmail.com)
+        GMAIL_APP_PASSWORD  a 16-char Gmail "app password" (NOT your normal password)
+        EMAIL_TO            comma-separated recipient address(es); defaults to GMAIL_ADDRESS
+    """
+    import smtplib
+    from email.mime.text import MIMEText
+
+    gmail_address = os.getenv("dhiraj.gautam@gmail.com")
+    gmail_app_password = os.getenv("zlzr npix sane daie")
+    email_to = os.getenv("EMAIL_TO", gmail_address)
+
+    if not gmail_address or not gmail_app_password:
+        log.warning("GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report.")
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = gmail_address
+    msg["To"] = email_to
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+            server.login(gmail_address, gmail_app_password)
+            server.sendmail(gmail_address, [a.strip() for a in email_to.split(",")], msg.as_string())
+        log.info("Email report sent to %s", email_to)
+    except Exception as e:
+        # Never let an email failure crash the trading run.
+        log.warning("Failed to send email report: %s", e)
 
 
 # ==========================================
@@ -386,62 +430,98 @@ def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
     setup_logging()
 
+    mode = "PAPER" if not args.live else "*** LIVE ***"
+    run_stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
+
     api_key = os.getenv("ALPACA_API_KEY")
     secret_key = os.getenv("ALPACA_SECRET_KEY")
     if not api_key or not secret_key:
         log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.")
+        send_email_report(
+            f"[TQQQ Bot] ERROR ({run_stamp})",
+            "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.",
+        )
         return 1
 
     paper = not args.live
-    mode = "PAPER" if paper else "*** LIVE ***"
     log.info("Starting | mode=%s | dry_run=%s", mode, args.dry_run)
 
     try:
         feed = DataFeed(os.getenv("ALPACA_FEED", "iex").lower())
     except ValueError:
         log.error("Invalid ALPACA_FEED (use 'iex' or 'sip').")
+        send_email_report(f"[TQQQ Bot] ERROR ({run_stamp})", "Invalid ALPACA_FEED env var (use 'iex' or 'sip').")
         return 1
 
     data_client = StockHistoricalDataClient(api_key, secret_key)
     trading_client = TradingClient(api_key, secret_key, paper=paper)
 
-    now_utc = datetime.now(timezone.utc)
-    start = now_utc - timedelta(days=365 * HISTORY_YEARS)
+    try:
+        now_utc = datetime.now(timezone.utc)
+        start = now_utc - timedelta(days=365 * HISTORY_YEARS)
 
-    log.info("Fetching %s weekly bars (%s feed)...", INDICATOR_SYMBOL, feed.value)
-    df = fetch_weekly_bars(data_client, INDICATOR_SYMBOL, start, now_utc, feed)
-    df = keep_completed_weeks(df, now_utc.astimezone(ET))
+        log.info("Fetching %s weekly bars (%s feed)...", INDICATOR_SYMBOL, feed.value)
+        df = fetch_weekly_bars(data_client, INDICATOR_SYMBOL, start, now_utc, feed)
+        df = keep_completed_weeks(df, now_utc.astimezone(ET))
 
-    if len(df) < MIN_BARS:
-        raise StrategyError(f"Only {len(df)} completed bars; need at least {MIN_BARS}.")
+        if len(df) < MIN_BARS:
+            raise StrategyError(f"Only {len(df)} completed bars; need at least {MIN_BARS}.")
 
-    df = compute_signals(df)
-    state = df["state"].dropna()
-    if state.empty:
-        raise StrategyError("No valid signal generated from indicators.")
+        df = compute_signals(df)
+        state = df["state"].dropna()
+        if state.empty:
+            raise StrategyError("No valid signal generated from indicators.")
 
-    latest_state = float(state.iloc[-1])
-    prev_state = float(state.iloc[-2]) if len(state) > 1 else np.nan
-    fresh_buy = latest_state == 1.0 and prev_state != 1.0
+        latest_state = float(state.iloc[-1])
+        prev_state = float(state.iloc[-2]) if len(state) > 1 else np.nan
+        fresh_buy = latest_state == 1.0 and prev_state != 1.0
 
-    last = df.iloc[-1]
-    log.info(
-        "Week of %s | close=%.2f EMA12=%.2f EMA26=%.2f MACD=%.3f Sig=%.3f RSI=%.1f | state=%s",
-        week_monday(df.index[-1]), last["close"], last["EMA12"], last["EMA26"],
-        last["MACD"], last["MACD_Signal"], last["RSI"],
-        "LONG" if latest_state == 1.0 else "FLAT",
-    )
+        last = df.iloc[-1]
+        week_str = str(week_monday(df.index[-1]))
+        state_str = "LONG (BUY)" if latest_state == 1.0 else "FLAT (SELL/OUT)"
 
-    execute(trading_client, target_long=(latest_state == 1.0), fresh_buy=fresh_buy, dry_run=args.dry_run)
-    return 0
+        indicator_summary = (
+            f"Week of {week_str}\n"
+            f"  Close:        {last['close']:.2f}\n"
+            f"  EMA12:        {last['EMA12']:.2f}\n"
+            f"  EMA26:        {last['EMA26']:.2f}\n"
+            f"  MACD:         {last['MACD']:.3f}\n"
+            f"  MACD Signal:  {last['MACD_Signal']:.3f}\n"
+            f"  RSI(14):      {last['RSI']:.1f}\n"
+            f"  Signal state: {state_str}\n"
+            f"  Fresh flip this week: {fresh_buy}"
+        )
+        log.info(
+            "Week of %s | close=%.2f EMA12=%.2f EMA26=%.2f MACD=%.3f Sig=%.3f RSI=%.1f | state=%s",
+            week_str, last["close"], last["EMA12"], last["EMA26"],
+            last["MACD"], last["MACD_Signal"], last["RSI"], state_str,
+        )
+
+        outcome = execute(
+            trading_client, target_long=(latest_state == 1.0), fresh_buy=fresh_buy, dry_run=args.dry_run
+        )
+
+        body = (
+            f"Run time: {run_stamp}\n"
+            f"Mode: {mode}{' (dry-run)' if args.dry_run else ''}\n\n"
+            f"{indicator_summary}\n\n"
+            f"Execution outcome:\n  {outcome}\n"
+        )
+        send_email_report(f"[TQQQ Bot] {state_str.split()[0]} - {week_str}", body)
+        return 0
+
+    except StrategyError as e:
+        log.error("ABORTED: %s", e)
+        send_email_report(f"[TQQQ Bot] ABORTED ({run_stamp})", f"Run time: {run_stamp}\nMode: {mode}\n\nABORTED: {e}")
+        return 1
+    except Exception as e:
+        log.exception("Unhandled error")
+        send_email_report(
+            f"[TQQQ Bot] UNHANDLED ERROR ({run_stamp})",
+            f"Run time: {run_stamp}\nMode: {mode}\n\nUnhandled error: {e}",
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except StrategyError as e:
-        log.error("ABORTED: %s", e)
-        sys.exit(1)
-    except Exception:
-        log.exception("Unhandled error")
-        sys.exit(1)
+    sys.exit(main())
