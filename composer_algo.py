@@ -38,6 +38,15 @@ TICKERS = ["TQQQ", "SOXL", "SQQQ", "BSV", "UVXY", "TECL"]
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
+# Collects human-readable lines during this run, for the end-of-run email report.
+RUN_LOG: list[str] = []
+
+
+def _log(line: str) -> None:
+    """Print + remember a line so it can go into the email report too."""
+    print(line)
+    RUN_LOG.append(line)
+
 
 # ==========================================
 # 2. INDICATOR LOGIC
@@ -157,8 +166,11 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
 # ==========================================
 # 4. COMPOSER SIGNAL ENGINE
 # ==========================================
-def evaluate_signal(df: pd.DataFrame) -> str:
-    """Evaluates the strategy logic using the latest daily price data."""
+def evaluate_signal(df: pd.DataFrame) -> tuple[str, str]:
+    """Evaluates the strategy logic using the latest daily price data.
+
+    Returns (target_ticker, branch_explanation).
+    """
     # 1. Moving Averages
     df["TQQQ_200SMA"] = df["TQQQ"].rolling(200).mean()
     df["TQQQ_20SMA"] = df["TQQQ"].rolling(20).mean()
@@ -189,36 +201,43 @@ def evaluate_signal(df: pd.DataFrame) -> str:
     # Strategy Decision Tree
     if tqqq_price > tqqq_200sma:
         if tqqq_rsi10 > 79:
-            print(f"BRANCH: TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) > 79 -> extremely overbought -> UVXY")
-            return "UVXY"
+            reason = f"TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) > 79 -> extremely overbought -> UVXY"
+            _log(f"BRANCH: {reason}")
+            return "UVXY", reason
         else:
-            print(f"BRANCH: TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) <= 79 -> uptrend intact -> TQQQ")
-            return "TQQQ"
+            reason = f"TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) <= 79 -> uptrend intact -> TQQQ"
+            _log(f"BRANCH: {reason}")
+            return "TQQQ", reason
     else:
         if tqqq_rsi10 < 31:
-            print(f"BRANCH: TQQQ <= 200SMA and RSI10 ({tqqq_rsi10:.1f}) < 31 -> oversold bounce -> TECL")
-            return "TECL"
+            reason = f"TQQQ <= 200SMA and RSI10 ({tqqq_rsi10:.1f}) < 31 -> oversold bounce -> TECL"
+            _log(f"BRANCH: {reason}")
+            return "TECL", reason
         else:
             if latest["SOXL_RSI10"] < 30:
-                print(f"BRANCH: downtrend, SOXL RSI10 ({latest['SOXL_RSI10']:.1f}) < 30 -> semis oversold -> SOXL")
-                return "SOXL"
+                reason = f"downtrend, SOXL RSI10 ({latest['SOXL_RSI10']:.1f}) < 30 -> semis oversold -> SOXL"
+                _log(f"BRANCH: {reason}")
+                return "SOXL", reason
             else:
                 if tqqq_price < latest["TQQQ_20SMA"]:
                     if latest["SQQQ_RSI10"] >= latest["BSV_RSI10"]:
-                        print(
-                            f"BRANCH: downtrend, TQQQ < 20SMA, SQQQ RSI10 "
+                        reason = (
+                            f"downtrend, TQQQ < 20SMA, SQQQ RSI10 "
                             f"({latest['SQQQ_RSI10']:.1f}) >= BSV RSI10 ({latest['BSV_RSI10']:.1f}) -> SQQQ"
                         )
-                        return "SQQQ"
+                        _log(f"BRANCH: {reason}")
+                        return "SQQQ", reason
                     else:
-                        print(
-                            f"BRANCH: downtrend, TQQQ < 20SMA, BSV RSI10 "
+                        reason = (
+                            f"downtrend, TQQQ < 20SMA, BSV RSI10 "
                             f"({latest['BSV_RSI10']:.1f}) > SQQQ RSI10 ({latest['SQQQ_RSI10']:.1f}) -> BSV"
                         )
-                        return "BSV"
+                        _log(f"BRANCH: {reason}")
+                        return "BSV", reason
                 else:
-                    print("BRANCH: downtrend on 200SMA but TQQQ still above 20SMA -> stay long -> TQQQ")
-                    return "TQQQ"
+                    reason = "downtrend on 200SMA but TQQQ still above 20SMA -> stay long -> TQQQ"
+                    _log(f"BRANCH: {reason}")
+                    return "TQQQ", reason
 
 
 # ==========================================
@@ -244,25 +263,29 @@ def wait_for_liquidation(symbol: str, timeout: int = 15, poll_interval: float = 
 # ==========================================
 # 6. REBALANCING ENGINE
 # ==========================================
-def rebalance(target_ticker: str):
-    """Liquidates out-of-strategy positions and enters the target position using the hardcoded budget cap."""
+def rebalance(target_ticker: str) -> str:
+    """Liquidates out-of-strategy positions and enters the target position using the hardcoded budget cap.
+
+    Returns a short human-readable outcome string for reporting.
+    """
     try:
         positions = {p.symbol: float(p.qty) for p in trading_client.get_all_positions()}
     except Exception as e:
         print(f"ERROR: Failed to retrieve account positions: {e}")
         sys.exit(1)
 
-    print("--- REBALANCE RUN STARTED ---")
-    print(f"Mode: {'PAPER' if PAPER else 'LIVE'}")
-    print(f"Target Symbol: {target_ticker}")
-    print(f"Current Portfolio Positions: {positions}")
+    _log("--- REBALANCE RUN STARTED ---")
+    _log(f"Mode: {'PAPER' if PAPER else 'LIVE'}")
+    _log(f"Target Symbol: {target_ticker}")
+    _log(f"Current Portfolio Positions: {positions}")
 
     # Pre-check: Check if already correctly positioned before triggering liquidations
     if positions.get(target_ticker, 0) > 0 and all(
         symbol == target_ticker for symbol in positions.keys()
     ):
-        print(f"Already holding target asset ({target_ticker}) exclusively. No action needed.")
-        return
+        msg = f"Already holding target asset ({target_ticker}) exclusively. No action needed."
+        _log(msg)
+        return msg
 
     # Check for pending open orders to prevent duplicate execution
     try:
@@ -270,8 +293,9 @@ def rebalance(target_ticker: str):
         open_orders_request = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=symbols_in_play)
         open_orders = trading_client.get_orders(filter=open_orders_request)
         if open_orders:
-            print(f"SKIP: {len(open_orders)} open order(s) already exist on {symbols_in_play}. Not rebalancing.")
-            return
+            msg = f"SKIP: {len(open_orders)} open order(s) already exist on {symbols_in_play}. Not rebalancing."
+            _log(msg)
+            return msg
     except Exception as e:
         print(f"ERROR: Failed to check open orders: {e}")
         sys.exit(1)
@@ -286,9 +310,10 @@ def rebalance(target_ticker: str):
 
     # Step 1: Liquidate non-target assets synchronously
     liquidation_failed = False
+    liquidated_symbols = []
     for symbol in list(positions.keys()):
         if symbol != target_ticker:
-            print(f"Liquidating position: {symbol}...")
+            _log(f"Liquidating position: {symbol}...")
             try:
                 trading_client.close_position(symbol)
             except Exception as e:
@@ -300,9 +325,12 @@ def rebalance(target_ticker: str):
             confirmed = wait_for_liquidation(symbol, timeout=15)
             if not confirmed:
                 liquidation_failed = True
+            else:
+                liquidated_symbols.append(symbol)
 
     if liquidation_failed:
-        print("ERROR: One or more liquidations failed or timed out. Aborting before entering a new position.")
+        msg = "ERROR: One or more liquidations failed or timed out. Aborting before entering a new position."
+        _log(msg)
         sys.exit(1)
 
     # Step 2: Poll cash balance until it reflects liquidation proceeds
@@ -317,7 +345,7 @@ def rebalance(target_ticker: str):
                 print(f"WARNING: Failed to read account cash balance: {e}")
             time.sleep(1)
         else:
-            print(
+            _log(
                 f"WARNING: Cash balance did not rise above pre-liquidation baseline "
                 f"(${cash_before:.2f}) after 10s; proceeding with last known value ${available_cash:.2f}."
             )
@@ -339,18 +367,83 @@ def rebalance(target_ticker: str):
         )
         try:
             trading_client.submit_order(order_data=market_order_data)
-            print(f"Successfully submitted Market BUY order: ${notional_amount} of {target_ticker}")
+            msg = f"Successfully submitted Market BUY order: ${notional_amount} of {target_ticker}"
+            _log(msg)
+            return msg
         except Exception as e:
             print(f"ERROR: Failed to submit order for {target_ticker}: {e}")
             sys.exit(1)
     else:
-        print(f"Execution skipped: Calculated spend (${notional_amount}) is below Alpaca's ${min_order_limit} minimum requirement.")
+        msg = f"Execution skipped: Calculated spend (${notional_amount}) is below Alpaca's ${min_order_limit} minimum requirement."
+        _log(msg)
+        return msg
+
+
+# ==========================================
+# 6b. EMAIL NOTIFICATION
+# ==========================================
+def send_email_report(subject: str, body: str) -> None:
+    """Sends a plain-text email via Gmail SMTP using an app password.
+
+    Required env vars:
+        GMAIL_ADDRESS       the Gmail account to send FROM (e.g. you@gmail.com)
+        GMAIL_APP_PASSWORD  a 16-char Gmail "app password" (NOT your normal password)
+        EMAIL_TO            comma-separated recipient address(es); defaults to GMAIL_ADDRESS
+    """
+    import smtplib
+    from email.mime.text import MIMEText
+
+    gmail_address = os.getenv("dhiraj.gautam@gmail.com")
+    gmail_app_password = os.getenv("zlzr npix sane daie")
+    email_to = os.getenv("EMAIL_TO", gmail_address)
+
+    if not gmail_address or not gmail_app_password:
+        print("WARNING: GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report.")
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = gmail_address
+    msg["To"] = email_to
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+            server.login(gmail_address, gmail_app_password)
+            server.sendmail(gmail_address, [a.strip() for a in email_to.split(",")], msg.as_string())
+        print(f"Email report sent to {email_to}")
+    except Exception as e:
+        # Never let an email failure crash the trading run.
+        print(f"WARNING: Failed to send email report: {e}")
 
 
 # ==========================================
 # 7. MAIN RUNNER
 # ==========================================
 if __name__ == "__main__":
-    market_data = get_market_data(TICKERS)
-    target_symbol = evaluate_signal(market_data)
-    rebalance(target_symbol)
+    run_stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        market_data = get_market_data(TICKERS)
+        target_symbol, branch_reason = evaluate_signal(market_data)
+        outcome = rebalance(target_symbol)
+
+        body = (
+            f"Run time: {run_stamp}\n"
+            f"Mode: {'PAPER' if PAPER else 'LIVE'}\n\n"
+            f"Signal: {target_symbol}\n"
+            f"Reason: {branch_reason}\n\n"
+            f"Rebalance outcome:\n  {outcome}\n\n"
+            f"--- Full run log ---\n" + "\n".join(RUN_LOG)
+        )
+        send_email_report(f"[Rotation Bot] {target_symbol} - {run_stamp}", body)
+
+    except SystemExit:
+        # get_market_data / evaluate_signal / rebalance call sys.exit(1) directly on
+        # fatal errors. Still send a notification email so a failed run isn't silent.
+        body = (
+            f"Run time: {run_stamp}\n"
+            f"Mode: {'PAPER' if PAPER else 'LIVE'}\n\n"
+            f"Run FAILED before completing. See log below.\n\n"
+            f"--- Full run log ---\n" + "\n".join(RUN_LOG)
+        )
+        send_email_report(f"[Rotation Bot] ERROR - {run_stamp}", body)
+        raise
