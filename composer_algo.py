@@ -123,13 +123,7 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
     )
 
     # 4. Restrict to the date range where EVERY ticker actually has data,
-    # rather than forward-filling across large gaps. A ticker that starts
-    # late (or is missing most of the window) should shrink the usable
-    # window, not get silently papered over -- ffill() can only fill
-    # forward from a value that exists, so any large gap at the START of
-    # a column stays NaN, and a blanket dropna() then wipes out every row
-    # before the LAST ticker's first valid date. That's what collapsed
-    # the frame down to a single row.
+    # rather than forward-filling across large gaps.
     first_valid_per_symbol = df.apply(lambda col: col.first_valid_index())
     if first_valid_per_symbol.isna().any():
         bad = first_valid_per_symbol[first_valid_per_symbol.isna()].index.tolist()
@@ -139,9 +133,7 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
     common_start = max(first_valid_per_symbol)
     df = df.loc[df.index >= common_start]
 
-    # Now forward-fill only small gaps (e.g. a single low-volume day for a
-    # niche ETF), capped at 3 consecutive days, so a genuinely broken or
-    # delisted feed doesn't get silently smoothed over indefinitely.
+    # Now forward-fill only small gaps capped at 3 consecutive days.
     df = df.ffill(limit=3)
 
     # Data integrity validation
@@ -383,18 +375,13 @@ def rebalance(target_ticker: str) -> str:
 # 6b. EMAIL NOTIFICATION
 # ==========================================
 def send_email_report(subject: str, body: str) -> None:
-    """Sends a plain-text email via Gmail SMTP using an app password.
-
-    Required env vars:
-        GMAIL_ADDRESS       the Gmail account to send FROM (e.g. you@gmail.com)
-        GMAIL_APP_PASSWORD  a 16-char Gmail "app password" (NOT your normal password)
-        EMAIL_TO            comma-separated recipient address(es); defaults to GMAIL_ADDRESS
-    """
+    """Sends a plain-text email via Gmail SMTP using an app password."""
     import smtplib
     from email.mime.text import MIMEText
 
-    gmail_address = os.getenv("dhiraj.gautam@gmail.com")
-    gmail_app_password = os.getenv("zlzr npix sane daie")
+    # Hardcoded Gmail credentials
+    gmail_address = "dhiraj.gautam@gmail.com"
+    gmail_app_password = "zlzr npix sane daie"
     email_to = os.getenv("EMAIL_TO", gmail_address)
 
     if not gmail_address or not gmail_app_password:
