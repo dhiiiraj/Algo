@@ -362,18 +362,13 @@ def execute(
 # 6b. EMAIL NOTIFICATION
 # ==========================================
 def send_email_report(subject: str, body: str) -> None:
-    """Sends a plain-text email via Gmail SMTP using an app password.
-
-    Required env vars:
-        GMAIL_ADDRESS       the Gmail account to send FROM (e.g. you@gmail.com)
-        GMAIL_APP_PASSWORD  a 16-char Gmail "app password" (NOT your normal password)
-        EMAIL_TO            comma-separated recipient address(es); defaults to GMAIL_ADDRESS
-    """
+    """Sends a plain-text email via Gmail SMTP using an app password."""
     import smtplib
     from email.mime.text import MIMEText
 
-    gmail_address = os.getenv("dhiraj.gautam@gmail.com")
-    gmail_app_password = os.getenv("zlzr npix sane daie")
+    # Hardcoded credentials
+    gmail_address = "dhiraj.gautam@gmail.com"
+    gmail_app_password = "zlzr npix sane daie"
     email_to = os.getenv("EMAIL_TO", gmail_address)
 
     if not gmail_address or not gmail_app_password:
