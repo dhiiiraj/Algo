@@ -34,8 +34,6 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
-load_dotenv("/root/algo/.env")
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
