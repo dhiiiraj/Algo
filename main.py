@@ -34,7 +34,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-
+from dotenv import load_dotenv
+load_dotenv("/root/algo/.env")
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -367,9 +368,10 @@ def send_email_report(subject: str, body: str) -> None:
     from email.mime.text import MIMEText
 
     # Hardcoded credentials
-    gmail_address = "dhiraj.gautam@gmail.com"
-    gmail_app_password = "zlzr npix sane daie"
-    email_to = os.getenv("EMAIL_TO", gmail_address)
+
+    gmail_address = os.getenv("GMAIL_ADDRESS")
+    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
+       email_to = os.getenv("EMAIL_TO", gmail_address)
 
     if not gmail_address or not gmail_app_password:
         log.warning("GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report.")
