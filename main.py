@@ -371,7 +371,7 @@ def send_email_report(subject: str, body: str) -> None:
 
     gmail_address = os.getenv("GMAIL_ADDRESS")
     gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
-       email_to = os.getenv("EMAIL_TO", gmail_address)
+    email_to = os.getenv("EMAIL_TO", gmail_address)
 
     if not gmail_address or not gmail_app_password:
         log.warning("GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report.")
