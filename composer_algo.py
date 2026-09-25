@@ -1,9 +1,32 @@
+#!/usr/bin/env python3
+"""
+Multi-Asset Rotation Bot (Alpaca) with Google Sheets Execution Logging.
+
+Strategy:
+    Evaluates Composer-style 200SMA, 20SMA, and 10-period RSI signals across 
+    TQQQ, SOXL, SQQQ, BSV, UVXY, and TECL to select a single target ticker.
+    Liquidates out-of-strategy positions and enters the target asset up to 
+    MAX_BUDGET.
+
+Usage:
+    export ALPACA_API_KEY=...
+    export ALPACA_SECRET_KEY=...
+    export GOOGLE_SHEET_ID=...
+    export GOOGLE_SERVICE_ACCOUNT_JSON='{"type": "service_account", ...}'
+
+    python rotation_bot.py
+"""
+
+import base64
+import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
@@ -12,9 +35,14 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
+import gspread
+from google.oauth2.service_account import Credentials
+
 # ==========================================
 # 1. CONFIGURATION & CREDENTIALS
 # ==========================================
+STRATEGY_ID = "COMPOSER_ROTATION_V1"  # Unique Strategy ID for trade tracking
+
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
@@ -38,7 +66,7 @@ TICKERS = ["TQQQ", "SOXL", "SQQQ", "BSV", "UVXY", "TECL"]
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# Collects human-readable lines during this run, for the end-of-run email report.
+# Collects human-readable lines during this run for the end-of-run email report.
 RUN_LOG: list[str] = []
 
 
@@ -46,6 +74,112 @@ def _log(line: str) -> None:
     """Print + remember a line so it can go into the email report too."""
     print(line)
     RUN_LOG.append(line)
+
+
+# ==========================================
+# 1b. GOOGLE SHEETS EXECUTION LOGGER
+# ==========================================
+class GoogleSheetExecutionLogger:
+    """Logs trade executions directly to a live Google Sheet using gspread."""
+
+    def __init__(self):
+        self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        self.creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        self.worksheet = None
+
+        if not self.sheet_id or not self.creds_json:
+            print("WARNING: GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set. Google Sheets logging disabled.")
+            return
+
+        try:
+            raw_json = self.creds_json.strip()
+
+            # Remove wrapping quotes if environment variable was pasted with outer quotes
+            if (raw_json.startswith('"') and raw_json.endswith('"')) or (raw_json.startswith("'") and raw_json.endswith("'")):
+                raw_json = raw_json[1:-1].strip()
+
+            # Base64 decode fallback check
+            if not raw_json.startswith("{"):
+                try:
+                    raw_json = base64.b64decode(raw_json).decode("utf-8").strip()
+                except Exception:
+                    pass
+
+            # Clean raw string for json.loads in case newlines were unescaped in App Platform
+            try:
+                creds_dict = json.loads(raw_json)
+            except json.JSONDecodeError:
+                cleaned_json = raw_json.replace("\n", "\\n")
+                creds_dict = json.loads(cleaned_json)
+
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+            client = gspread.authorize(creds)
+            self.worksheet = client.open_by_key(self.sheet_id).sheet1
+            self._ensure_headers()
+        except Exception as e:
+            print(f"ERROR: Failed to connect to Google Sheets: {e}")
+            self.worksheet = None
+
+    def _ensure_headers(self):
+        """Creates table headers if the sheet is completely empty."""
+        try:
+            if not self.worksheet.get_all_values():
+                headers = [
+                    "timestamp_utc",
+                    "strategy_id",
+                    "broker_order_id",
+                    "symbol",
+                    "action",
+                    "notional_usd",
+                    "qty_shares",
+                    "status",
+                    "dry_run",
+                    "reason",
+                ]
+                self.worksheet.append_row(headers)
+        except Exception as e:
+            print(f"WARNING: Could not verify or write Google Sheet headers: {e}")
+
+    def log_execution(
+        self,
+        broker_order_id: str,
+        symbol: str,
+        action: str,
+        notional_usd: float,
+        qty_shares: float,
+        status: str,
+        dry_run: bool,
+        reason: str,
+    ):
+        if not self.worksheet:
+            print("WARNING: Skipping Google Sheets log entry (client not connected).")
+            return
+
+        try:
+            row = [
+                datetime.now(timezone.utc).isoformat(),
+                STRATEGY_ID,
+                broker_order_id,
+                symbol,
+                action.upper(),
+                round(notional_usd, 2) if notional_usd else 0.0,
+                round(qty_shares, 4) if qty_shares else 0.0,
+                status,
+                dry_run,
+                reason,
+            ]
+            self.worksheet.append_row(row)
+            print(f"Successfully logged trade execution [Strategy: {STRATEGY_ID} | OrderID: {broker_order_id}] to Google Sheets.")
+        except Exception as e:
+            print(f"ERROR: Failed to append trade record to Google Sheet: {e}")
+
+
+# Initialize Execution Logger
+exec_logger = GoogleSheetExecutionLogger()
 
 
 # ==========================================
@@ -70,7 +204,7 @@ def calc_composer_rsi10(series: pd.Series, window: int = 10) -> pd.Series:
 
 
 # ==========================================
-# 3. MARKET DATA FETCHING (TIMESTAMP ALIGNMENT FIX)
+# 3. MARKET DATA FETCHING
 # ==========================================
 def get_market_data(tickers: list[str]) -> pd.DataFrame:
     """Fetches historical daily close prices required for 200 SMA calculation."""
@@ -95,15 +229,12 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
         print("ERROR: No market data returned for any ticker.")
         sys.exit(1)
 
-    # 1. Reset index to extract symbol and timestamp columns
+    # Reset index to extract symbol and timestamp columns
     bars_reset = bars.reset_index()
 
-    # 2. Normalize timestamps to calendar dates (removes time-of-day mismatch across symbols)
+    # Normalize timestamps to calendar dates
     bars_reset['date'] = pd.to_datetime(bars_reset['timestamp']).dt.date
 
-    # DIAGNOSTIC: per-symbol row counts and date ranges, printed before any
-    # NaN handling. If one ticker is sparse or missing, this reveals it --
-    # a bare "N rows" failure downstream doesn't say WHICH ticker caused it.
     print("Per-symbol bar coverage in this window:")
     coverage = bars_reset.groupby('symbol')['date'].agg(count='count', first='min', last='max')
     for symbol, row in coverage.iterrows():
@@ -114,7 +245,7 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
         print(f"ERROR: No data returned at all for ticker(s): {missing}")
         sys.exit(1)
 
-    # 3. Pivot using calendar date index instead of exact timestamp
+    # Pivot using calendar date index
     df = bars_reset.pivot_table(
         index='date',
         columns='symbol',
@@ -122,8 +253,6 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
         aggfunc='last'
     )
 
-    # 4. Restrict to the date range where EVERY ticker actually has data,
-    # rather than forward-filling across large gaps.
     first_valid_per_symbol = df.apply(lambda col: col.first_valid_index())
     if first_valid_per_symbol.isna().any():
         bad = first_valid_per_symbol[first_valid_per_symbol.isna()].index.tolist()
@@ -133,10 +262,9 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
     common_start = max(first_valid_per_symbol)
     df = df.loc[df.index >= common_start]
 
-    # Now forward-fill only small gaps capped at 3 consecutive days.
+    # Forward-fill small gaps capped at 3 consecutive days
     df = df.ffill(limit=3)
 
-    # Data integrity validation
     missing = [t for t in tickers if t not in df.columns]
     if missing:
         print(f"ERROR: No data returned for ticker(s): {missing}")
@@ -149,7 +277,6 @@ def get_market_data(tickers: list[str]) -> pd.DataFrame:
 
     if len(df) < MIN_ROWS:
         print(f"ERROR: Insufficient price history returned ({len(df)} rows). Need at least {MIN_ROWS}.")
-        print(f"Common start date across all tickers was {common_start} -- check the per-symbol coverage above for the cause.")
         sys.exit(1)
 
     return df
@@ -163,20 +290,16 @@ def evaluate_signal(df: pd.DataFrame) -> tuple[str, str]:
 
     Returns (target_ticker, branch_explanation).
     """
-    # 1. Moving Averages
     df["TQQQ_200SMA"] = df["TQQQ"].rolling(200).mean()
     df["TQQQ_20SMA"] = df["TQQQ"].rolling(20).mean()
 
-    # 2. 10-period RSIs
     df["TQQQ_RSI10"] = calc_composer_rsi10(df["TQQQ"], 10)
     df["SOXL_RSI10"] = calc_composer_rsi10(df["SOXL"], 10)
     df["SQQQ_RSI10"] = calc_composer_rsi10(df["SQQQ"], 10)
     df["BSV_RSI10"] = calc_composer_rsi10(df["BSV"], 10)
 
-    # Use the most recent completed market candle
     latest = df.iloc[-1]
 
-    # Validate no required values are NaN before evaluating decision tree
     required_fields = [
         "TQQQ", "TQQQ_200SMA", "TQQQ_20SMA", "TQQQ_RSI10",
         "SOXL_RSI10", "SQQQ_RSI10", "BSV_RSI10",
@@ -190,7 +313,6 @@ def evaluate_signal(df: pd.DataFrame) -> tuple[str, str]:
     tqqq_200sma = latest["TQQQ_200SMA"]
     tqqq_rsi10 = latest["TQQQ_RSI10"]
 
-    # Strategy Decision Tree
     if tqqq_price > tqqq_200sma:
         if tqqq_rsi10 > 79:
             reason = f"TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) > 79 -> extremely overbought -> UVXY"
@@ -255,7 +377,7 @@ def wait_for_liquidation(symbol: str, timeout: int = 15, poll_interval: float = 
 # ==========================================
 # 6. REBALANCING ENGINE
 # ==========================================
-def rebalance(target_ticker: str) -> str:
+def rebalance(target_ticker: str, reason: str) -> str:
     """Liquidates out-of-strategy positions and enters the target position using the hardcoded budget cap.
 
     Returns a short human-readable outcome string for reporting.
@@ -267,11 +389,12 @@ def rebalance(target_ticker: str) -> str:
         sys.exit(1)
 
     _log("--- REBALANCE RUN STARTED ---")
+    _log(f"Strategy ID: {STRATEGY_ID}")
     _log(f"Mode: {'PAPER' if PAPER else 'LIVE'}")
     _log(f"Target Symbol: {target_ticker}")
     _log(f"Current Portfolio Positions: {positions}")
 
-    # Pre-check: Check if already correctly positioned before triggering liquidations
+    # Check if already correctly positioned before triggering liquidations
     if positions.get(target_ticker, 0) > 0 and all(
         symbol == target_ticker for symbol in positions.keys()
     ):
@@ -302,12 +425,24 @@ def rebalance(target_ticker: str) -> str:
 
     # Step 1: Liquidate non-target assets synchronously
     liquidation_failed = False
-    liquidated_symbols = []
-    for symbol in list(positions.keys()):
+    for symbol, qty in positions.items():
         if symbol != target_ticker:
-            _log(f"Liquidating position: {symbol}...")
+            _log(f"Liquidating position: {symbol} ({qty} shares)...")
             try:
-                trading_client.close_position(symbol)
+                close_order = trading_client.close_position(symbol)
+                order_id = str(close_order.id)
+                status = str(getattr(close_order.status, "value", close_order.status))
+                
+                exec_logger.log_execution(
+                    broker_order_id=order_id,
+                    symbol=symbol,
+                    action="SELL",
+                    notional_usd=0.0,
+                    qty_shares=qty,
+                    status=status,
+                    dry_run=False,
+                    reason=f"Rotation away from {symbol} to {target_ticker}",
+                )
             except Exception as e:
                 print(f"ERROR: Failed to submit close position order for {symbol}: {e}")
                 liquidation_failed = True
@@ -317,8 +452,6 @@ def rebalance(target_ticker: str) -> str:
             confirmed = wait_for_liquidation(symbol, timeout=15)
             if not confirmed:
                 liquidation_failed = True
-            else:
-                liquidated_symbols.append(symbol)
 
     if liquidation_failed:
         msg = "ERROR: One or more liquidations failed or timed out. Aborting before entering a new position."
@@ -342,10 +475,7 @@ def rebalance(target_ticker: str) -> str:
                 f"(${cash_before:.2f}) after 10s; proceeding with last known value ${available_cash:.2f}."
             )
 
-    # Cap execution to whichever is smaller: your MAX_BUDGET setting or actual account cash
     target_spend = min(MAX_BUDGET, available_cash)
-
-    # 0.5% buffer for market order price slippage
     notional_amount = round(target_spend * 0.995, 2)
     min_order_limit = 10.00  # Alpaca dollar limit for fractional orders
 
@@ -358,8 +488,22 @@ def rebalance(target_ticker: str) -> str:
             time_in_force=TimeInForce.DAY
         )
         try:
-            trading_client.submit_order(order_data=market_order_data)
-            msg = f"Successfully submitted Market BUY order: ${notional_amount} of {target_ticker}"
+            buy_order = trading_client.submit_order(order_data=market_order_data)
+            order_id = str(buy_order.id)
+            status = str(getattr(buy_order.status, "value", buy_order.status))
+
+            exec_logger.log_execution(
+                broker_order_id=order_id,
+                symbol=target_ticker,
+                action="BUY",
+                notional_usd=notional_amount,
+                qty_shares=0.0,
+                status=status,
+                dry_run=False,
+                reason=reason,
+            )
+
+            msg = f"Successfully submitted Market BUY order: ${notional_amount} of {target_ticker} | Order ID: {order_id}"
             _log(msg)
             return msg
         except Exception as e:
@@ -379,7 +523,6 @@ def send_email_report(subject: str, body: str) -> None:
     import smtplib
     from email.mime.text import MIMEText
 
-    # Hardcoded Gmail credentials
     gmail_address = "dhiraj.gautam@gmail.com"
     gmail_app_password = "zlzr npix sane daie"
     email_to = os.getenv("EMAIL_TO", gmail_address)
@@ -399,7 +542,6 @@ def send_email_report(subject: str, body: str) -> None:
             server.sendmail(gmail_address, [a.strip() for a in email_to.split(",")], msg.as_string())
         print(f"Email report sent to {email_to}")
     except Exception as e:
-        # Never let an email failure crash the trading run.
         print(f"WARNING: Failed to send email report: {e}")
 
 
@@ -411,26 +553,26 @@ if __name__ == "__main__":
     try:
         market_data = get_market_data(TICKERS)
         target_symbol, branch_reason = evaluate_signal(market_data)
-        outcome = rebalance(target_symbol)
+        outcome = rebalance(target_symbol, branch_reason)
 
         body = (
             f"Run time: {run_stamp}\n"
+            f"Strategy ID: {STRATEGY_ID}\n"
             f"Mode: {'PAPER' if PAPER else 'LIVE'}\n\n"
             f"Signal: {target_symbol}\n"
             f"Reason: {branch_reason}\n\n"
             f"Rebalance outcome:\n  {outcome}\n\n"
             f"--- Full run log ---\n" + "\n".join(RUN_LOG)
         )
-        send_email_report(f"[Rotation Bot] {target_symbol} - {run_stamp}", body)
+        send_email_report(f"[{STRATEGY_ID}] {target_symbol} - {run_stamp}", body)
 
     except SystemExit:
-        # get_market_data / evaluate_signal / rebalance call sys.exit(1) directly on
-        # fatal errors. Still send a notification email so a failed run isn't silent.
         body = (
             f"Run time: {run_stamp}\n"
+            f"Strategy ID: {STRATEGY_ID}\n"
             f"Mode: {'PAPER' if PAPER else 'LIVE'}\n\n"
             f"Run FAILED before completing. See log below.\n\n"
             f"--- Full run log ---\n" + "\n".join(RUN_LOG)
         )
-        send_email_report(f"[Rotation Bot] ERROR - {run_stamp}", body)
+        send_email_report(f"[{STRATEGY_ID}] ERROR - {run_stamp}", body)
         raise
