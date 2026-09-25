@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Weekly QQQ-signal / TQQQ-trade bot (Alpaca).
+Weekly QQQ-signal / TQQQ-trade bot (Alpaca) with Google Sheets Execution Logging.
 
 Signal (computed on COMPLETED weekly QQQ bars only):
     BUY  state : MACD > MACD signal  AND  EMA12 > EMA26
@@ -10,23 +10,26 @@ Signal (computed on COMPLETED weekly QQQ bars only):
 Usage:
     export ALPACA_API_KEY=...
     export ALPACA_SECRET_KEY=...
+    export GOOGLE_SHEET_ID=...
+    export GOOGLE_SERVICE_ACCOUNT_JSON='{"type": "service_account", ...}'
 
     python tqqq_weekly_bot.py --dry-run      # paper account, log decision only
     python tqqq_weekly_bot.py                # paper account, places orders
     python tqqq_weekly_bot.py --live         # REAL MONEY, places orders
 
-Best run after Friday's close (or on the weekend / before Monday's open).
-
 Optional env vars:
-    ALPACA_FEED  iex (default) | sip
-    LOG_FILE     path to log file (default: tqqq_weekly_bot.log next to script)
+    ALPACA_FEED      iex (default) | sip
+    LOG_FILE         path to log file (default: tqqq_weekly_bot.log next to script)
 """
 
 import argparse
+import base64
+import json
 import logging
 import os
 import sys
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
 from typing import Optional
@@ -43,9 +46,14 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
+import gspread
+from google.oauth2.service_account import Credentials
+
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
+STRATEGY_ID = "QQQ_MACD_WEEKLY_V1"  # Unique Strategy ID for trade tracking
+
 INDICATOR_SYMBOL = "QQQ"
 TRADE_SYMBOL = "TQQQ"
 
@@ -82,6 +90,109 @@ log = logging.getLogger("tqqq_bot")
 
 class StrategyError(Exception):
     """Expected, non-recoverable problem (bad data, blocked account, etc.)."""
+
+
+# ==========================================
+# 1b. GOOGLE SHEETS EXECUTION LOGGER
+# ==========================================
+class GoogleSheetExecutionLogger:
+    """Logs trade executions directly to a live Google Sheet using gspread."""
+
+    def __init__(self):
+        self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        self.creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        self.worksheet = None
+
+        if not self.sheet_id or not self.creds_json:
+            log.warning("GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set. Google Sheets logging disabled.")
+            return
+
+        try:
+            raw_json = self.creds_json.strip()
+
+            # Remove wrapping quotes if environment variable was pasted with outer quotes
+            if (raw_json.startswith('"') and raw_json.endswith('"')) or (raw_json.startswith("'") and raw_json.endswith("'")):
+                raw_json = raw_json[1:-1].strip()
+
+            # Base64 decode fallback check
+            if not raw_json.startswith("{"):
+                try:
+                    raw_json = base64.b64decode(raw_json).decode("utf-8").strip()
+                except Exception as b64_err:
+                    log.debug("Base64 decode skipped/failed: %s", b64_err)
+
+            # Clean raw string for json.loads in case newlines were unescaped in App Platform
+            try:
+                creds_dict = json.loads(raw_json)
+            except json.JSONDecodeError:
+                # Replace literal newlines inside private keys if present
+                cleaned_json = raw_json.replace("\n", "\\n")
+                creds_dict = json.loads(cleaned_json)
+
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+            client = gspread.authorize(creds)
+            self.worksheet = client.open_by_key(self.sheet_id).sheet1
+            self._ensure_headers()
+        except Exception as e:
+            log.error("Failed to connect to Google Sheets: %s", e)
+            self.worksheet = None
+
+    def _ensure_headers(self):
+        """Creates table headers if the sheet is completely empty."""
+        try:
+            if not self.worksheet.get_all_values():
+                headers = [
+                    "timestamp_utc",
+                    "strategy_id",
+                    "broker_order_id",
+                    "symbol",
+                    "action",
+                    "notional_usd",
+                    "qty_shares",
+                    "status",
+                    "dry_run",
+                    "reason",
+                ]
+                self.worksheet.append_row(headers)
+        except Exception as e:
+            log.warning("Could not verify or write Google Sheet headers: %s", e)
+
+    def log_execution(
+        self,
+        broker_order_id: str,
+        symbol: str,
+        action: str,
+        notional_usd: float,
+        qty_shares: float,
+        status: str,
+        dry_run: bool,
+        reason: str,
+    ):
+        if not self.worksheet:
+            log.warning("Skipping Google Sheets log entry (client not connected).")
+            return
+
+        try:
+            row = [
+                datetime.now(timezone.utc).isoformat(),
+                STRATEGY_ID,
+                broker_order_id,
+                symbol,
+                action.upper(),
+                round(notional_usd, 2) if notional_usd else 0.0,
+                round(qty_shares, 4) if qty_shares else 0.0,
+                status,
+                dry_run,
+                reason,
+            ]
+            self.worksheet.append_row(row)
+            log.info("Successfully logged trade execution [Strategy: %s | OrderID: %s] to Google Sheets.", STRATEGY_ID, broker_order_id)
+        except Exception as e:
+            log.error("Failed to append trade record to Google Sheet: %s", e)
 
 
 # ==========================================
@@ -260,9 +371,10 @@ def execute(
     target_long: bool,
     fresh_buy: bool,
     dry_run: bool,
+    exec_logger: GoogleSheetExecutionLogger,
 ) -> str:
     """Places (or logs) the trade and returns a short human-readable outcome string."""
-    log.info("================ EXECUTION ================")
+    log.info("================ EXECUTION [Strategy ID: %s] ================", STRATEGY_ID)
 
     account = trading_client.get_account()
     if account.trading_blocked or account.account_blocked:
@@ -314,9 +426,21 @@ def execute(
             msg = f"Trade amount ${amount:.2f} below minimum ${MIN_TRADE_AMOUNT:.2f}; not buying."
             log.error(msg)
             return msg
+
         if dry_run:
+            dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
             msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
-            log.info(msg)
+            log.info("%s | Simulated Order ID: %s", msg, dry_id)
+            exec_logger.log_execution(
+                broker_order_id=dry_id,
+                symbol=TRADE_SYMBOL,
+                action="BUY",
+                notional_usd=amount,
+                qty_shares=0.0,
+                status="DRY_RUN",
+                dry_run=True,
+                reason="Weekly MACD/EMA Bullish Signal",
+            )
             return msg
 
         order = trading_client.submit_order(
@@ -331,15 +455,39 @@ def execute(
         if market_open:
             order = wait_for_order(trading_client, order)
             log.info("BUY order status: %s (filled_qty=%s)", _status(order), order.filled_qty)
+
         assert_order_ok(order, "BUY")
-        return f"BUY ${amount:.2f} of {TRADE_SYMBOL} | order status: {_status(order)}"
+
+        exec_logger.log_execution(
+            broker_order_id=str(order.id),
+            symbol=TRADE_SYMBOL,
+            action="BUY",
+            notional_usd=amount,
+            qty_shares=float(order.filled_qty or 0.0),
+            status=_status(order),
+            dry_run=False,
+            reason="Weekly MACD/EMA Bullish Signal",
+        )
+        return f"BUY ${amount:.2f} of {TRADE_SYMBOL} | Order ID: {order.id} | Status: {_status(order)}"
 
     # ---- SELL ----
     elif not target_long and qty > 0:
         log.info("SELL signal. Closing entire %s position (%s shares).", TRADE_SYMBOL, qty)
+
         if dry_run:
-            msg = f"[DRY RUN] Would close position in {TRADE_SYMBOL}."
-            log.info(msg)
+            dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
+            msg = f"[DRY RUN] Would close position in {TRADE_SYMBOL} ({qty} shares)."
+            log.info("%s | Simulated Order ID: %s", msg, dry_id)
+            exec_logger.log_execution(
+                broker_order_id=dry_id,
+                symbol=TRADE_SYMBOL,
+                action="SELL",
+                notional_usd=0.0,
+                qty_shares=qty,
+                status="DRY_RUN",
+                dry_run=True,
+                reason="Weekly Trend Breakdown / Overbought Signal",
+            )
             return msg
 
         order = trading_client.close_position(TRADE_SYMBOL)
@@ -347,8 +495,20 @@ def execute(
         if market_open:
             order = wait_for_order(trading_client, order)
             log.info("CLOSE order status: %s (filled_qty=%s)", _status(order), order.filled_qty)
+
         assert_order_ok(order, "CLOSE")
-        return f"SOLD entire {TRADE_SYMBOL} position ({qty} shares) | order status: {_status(order)}"
+
+        exec_logger.log_execution(
+            broker_order_id=str(order.id),
+            symbol=TRADE_SYMBOL,
+            action="SELL",
+            notional_usd=0.0,
+            qty_shares=qty,
+            status=_status(order),
+            dry_run=False,
+            reason="Weekly Trend Breakdown / Overbought Signal",
+        )
+        return f"SOLD entire {TRADE_SYMBOL} position ({qty} shares) | Order ID: {order.id} | Status: {_status(order)}"
 
     # ---- HOLD ----
     else:
@@ -364,8 +524,6 @@ def send_email_report(subject: str, body: str) -> None:
     """Sends a plain-text email via Gmail SMTP using an app password."""
     import smtplib
     from email.mime.text import MIMEText
-
-    # Hardcoded credentials
 
     gmail_address = os.getenv("GMAIL_ADDRESS")
     gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
@@ -425,6 +583,7 @@ def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
     setup_logging()
 
+    exec_logger = GoogleSheetExecutionLogger()
     mode = "PAPER" if not args.live else "*** LIVE ***"
     run_stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
 
@@ -433,19 +592,19 @@ def main(argv: Optional[list] = None) -> int:
     if not api_key or not secret_key:
         log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.")
         send_email_report(
-            f"[TQQQ Bot] ERROR ({run_stamp})",
+            f"[{STRATEGY_ID}] ERROR ({run_stamp})",
             "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.",
         )
         return 1
 
     paper = not args.live
-    log.info("Starting | mode=%s | dry_run=%s", mode, args.dry_run)
+    log.info("Starting Strategy [%s] | mode=%s | dry_run=%s", STRATEGY_ID, mode, args.dry_run)
 
     try:
         feed = DataFeed(os.getenv("ALPACA_FEED", "iex").lower())
     except ValueError:
         log.error("Invalid ALPACA_FEED (use 'iex' or 'sip').")
-        send_email_report(f"[TQQQ Bot] ERROR ({run_stamp})", "Invalid ALPACA_FEED env var (use 'iex' or 'sip').")
+        send_email_report(f"[{STRATEGY_ID}] ERROR ({run_stamp})", "Invalid ALPACA_FEED env var (use 'iex' or 'sip').")
         return 1
 
     data_client = StockHistoricalDataClient(api_key, secret_key)
@@ -476,13 +635,14 @@ def main(argv: Optional[list] = None) -> int:
         state_str = "LONG (BUY)" if latest_state == 1.0 else "FLAT (SELL/OUT)"
 
         indicator_summary = (
+            f"Strategy ID: {STRATEGY_ID}\n"
             f"Week of {week_str}\n"
-            f"  Close:        {last['close']:.2f}\n"
-            f"  EMA12:        {last['EMA12']:.2f}\n"
-            f"  EMA26:        {last['EMA26']:.2f}\n"
-            f"  MACD:         {last['MACD']:.3f}\n"
-            f"  MACD Signal:  {last['MACD_Signal']:.3f}\n"
-            f"  RSI(14):      {last['RSI']:.1f}\n"
+            f"  Close:         {last['close']:.2f}\n"
+            f"  EMA12:         {last['EMA12']:.2f}\n"
+            f"  EMA26:         {last['EMA26']:.2f}\n"
+            f"  MACD:          {last['MACD']:.3f}\n"
+            f"  MACD Signal:   {last['MACD_Signal']:.3f}\n"
+            f"  RSI(14):       {last['RSI']:.1f}\n"
             f"  Signal state: {state_str}\n"
             f"  Fresh flip this week: {fresh_buy}"
         )
@@ -493,26 +653,31 @@ def main(argv: Optional[list] = None) -> int:
         )
 
         outcome = execute(
-            trading_client, target_long=(latest_state == 1.0), fresh_buy=fresh_buy, dry_run=args.dry_run
+            trading_client=trading_client,
+            target_long=(latest_state == 1.0),
+            fresh_buy=fresh_buy,
+            dry_run=args.dry_run,
+            exec_logger=exec_logger,
         )
 
         body = (
             f"Run time: {run_stamp}\n"
+            f"Strategy ID: {STRATEGY_ID}\n"
             f"Mode: {mode}{' (dry-run)' if args.dry_run else ''}\n\n"
             f"{indicator_summary}\n\n"
             f"Execution outcome:\n  {outcome}\n"
         )
-        send_email_report(f"[TQQQ Bot] {state_str.split()[0]} - {week_str}", body)
+        send_email_report(f"[{STRATEGY_ID}] {state_str.split()[0]} - {week_str}", body)
         return 0
 
     except StrategyError as e:
         log.error("ABORTED: %s", e)
-        send_email_report(f"[TQQQ Bot] ABORTED ({run_stamp})", f"Run time: {run_stamp}\nMode: {mode}\n\nABORTED: {e}")
+        send_email_report(f"[{STRATEGY_ID}] ABORTED ({run_stamp})", f"Run time: {run_stamp}\nMode: {mode}\n\nABORTED: {e}")
         return 1
     except Exception as e:
         log.exception("Unhandled error")
         send_email_report(
-            f"[TQQQ Bot] UNHANDLED ERROR ({run_stamp})",
+            f"[{STRATEGY_ID}] UNHANDLED ERROR ({run_stamp})",
             f"Run time: {run_stamp}\nMode: {mode}\n\nUnhandled error: {e}",
         )
         return 1
