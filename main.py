@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Weekly QQQ-signal / TQQQ-trade bot (Alpaca) with Google Sheets Execution Logging.
+"""Weekly QQQ-signal / TQQQ-trade bot (Alpaca) with Google Sheets Execution Logging.
 
 Signal (computed on COMPLETED weekly QQQ bars only):
     BUY  state : MACD > MACD signal  AND  EMA12 > EMA26
@@ -35,8 +34,12 @@ from datetime import time as dtime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcal
+import gspread
+from google.oauth2.service_account import Credentials
 import numpy as np
 import pandas as pd
+
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -46,9 +49,6 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
-import gspread
-from google.oauth2.service_account import Credentials
-
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
@@ -57,11 +57,13 @@ STRATEGY_ID = "QQQ_MACD_WEEKLY_V1"  # Unique Strategy ID for trade tracking
 INDICATOR_SYMBOL = "QQQ"
 TRADE_SYMBOL = "TQQQ"
 
-HISTORY_YEARS = 8            # weekly history to pull (more = better indicator warm-up)
-MIN_BARS = 104               # minimum completed weekly bars required
+HISTORY_YEARS = 8  # weekly history to pull (more = better indicator warm-up)
+MIN_BARS = 104  # minimum completed weekly bars required
 
-CASH_DEPLOYMENT_PCT = 0.95   # fraction of available cash to deploy on a BUY
-MIN_TRADE_AMOUNT = 10.0      # self-imposed floor in USD (Alpaca's own minimum is lower)
+CASH_DEPLOYMENT_PCT = 0.95  # fraction of available cash to deploy on a BUY
+MIN_TRADE_AMOUNT = (
+    10.0  # self-imposed floor in USD (Alpaca's own minimum is lower)
+)
 
 # Ignore residual long fractional shares below this threshold to avoid false "held" states
 POSITION_DUST_THRESHOLD = 0.001
@@ -83,116 +85,144 @@ TERMINAL_STATUSES = {
     OrderStatus.REJECTED,
     OrderStatus.DONE_FOR_DAY,
 }
-FAILED_STATUSES = {OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED}
+FAILED_STATUSES = {
+    OrderStatus.REJECTED,
+    OrderStatus.CANCELED,
+    OrderStatus.EXPIRED,
+}
 
 log = logging.getLogger("tqqq_bot")
 
 
 class StrategyError(Exception):
-    """Expected, non-recoverable problem (bad data, blocked account, etc.)."""
+  """Expected, non-recoverable problem (bad data, blocked account, etc.)."""
 
 
 # ==========================================
 # 1b. GOOGLE SHEETS EXECUTION LOGGER
 # ==========================================
 class GoogleSheetExecutionLogger:
-    """Logs trade executions directly to a live Google Sheet using gspread."""
+  """Logs trade executions directly to a live Google Sheet using gspread."""
 
-    def __init__(self):
-        self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        self.creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-        self.worksheet = None
+  def __init__(self):
+    self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    self.creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    self.worksheet = None
 
-        if not self.sheet_id or not self.creds_json:
-            log.warning("GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set. Google Sheets logging disabled.")
-            return
+    if not self.sheet_id or not self.creds_json:
+      log.warning(
+          "GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set. Google"
+          " Sheets logging disabled."
+      )
+      return
 
+    try:
+      raw_json = self.creds_json.strip()
+
+      # Remove wrapping quotes if environment variable was pasted with outer quotes
+      if (raw_json.startswith('"') and raw_json.endswith('"')) or (
+          raw_json.startswith("'") and raw_json.endswith("'")
+      ):
+        raw_json = raw_json[1:-1].strip()
+
+      # Base64 decode fallback check
+      if not raw_json.startswith("{"):
         try:
-            raw_json = self.creds_json.strip()
+          raw_json = base64.b64decode(raw_json).decode("utf-8").strip()
+        except Exception as b64_err:
+          log.debug("Base64 decode skipped/failed: %s", b64_err)
 
-            # Remove wrapping quotes if environment variable was pasted with outer quotes
-            if (raw_json.startswith('"') and raw_json.endswith('"')) or (raw_json.startswith("'") and raw_json.endswith("'")):
-                raw_json = raw_json[1:-1].strip()
+      # Clean raw string for json.loads in case newlines were unescaped in App Platform
+      try:
+        creds_dict = json.loads(raw_json)
+      except json.JSONDecodeError:
+        # Replace literal newlines inside private keys if present
+        cleaned_json = raw_json.replace("\n", "\\n")
+        creds_dict = json.loads(cleaned_json)
 
-            # Base64 decode fallback check
-            if not raw_json.startswith("{"):
-                try:
-                    raw_json = base64.b64decode(raw_json).decode("utf-8").strip()
-                except Exception as b64_err:
-                    log.debug("Base64 decode skipped/failed: %s", b64_err)
+      scopes = [
+          "https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive",
+      ]
+      creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+      client = gspread.authorize(creds)
+      self.worksheet = client.open_by_key(self.sheet_id).sheet1
+      self._ensure_headers()
+    except Exception as e:
+      log.error("Failed to connect to Google Sheets: %s", e)
+      self.worksheet = None
 
-            # Clean raw string for json.loads in case newlines were unescaped in App Platform
-            try:
-                creds_dict = json.loads(raw_json)
-            except json.JSONDecodeError:
-                # Replace literal newlines inside private keys if present
-                cleaned_json = raw_json.replace("\n", "\\n")
-                creds_dict = json.loads(cleaned_json)
+  def _ensure_headers(self):
+    """Creates table headers if the sheet is completely empty."""
+    try:
+      if not self.worksheet.get_all_values():
+        headers = [
+            "timestamp_utc",
+            "strategy_id",
+            "broker_order_id",
+            "symbol",
+            "action",
+            "notional_usd",
+            "qty_shares",
+            "status",
+            "dry_run",
+            "reason",
+        ]
+        self.worksheet.append_row(headers)
+    except Exception as e:
+      log.warning("Could not verify or write Google Sheet headers: %s", e)
 
-            scopes = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ]
-            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-            client = gspread.authorize(creds)
-            self.worksheet = client.open_by_key(self.sheet_id).sheet1
-            self._ensure_headers()
-        except Exception as e:
-            log.error("Failed to connect to Google Sheets: %s", e)
-            self.worksheet = None
+  def log_execution(
+      self,
+      broker_order_id: str,
+      symbol: str,
+      action: str,
+      notional_usd: float,
+      qty_shares: float,
+      status: str,
+      dry_run: bool,
+      reason: str,
+  ):
+    if not self.worksheet:
+      log.warning("Skipping Google Sheets log entry (client not connected).")
+      return
 
-    def _ensure_headers(self):
-        """Creates table headers if the sheet is completely empty."""
-        try:
-            if not self.worksheet.get_all_values():
-                headers = [
-                    "timestamp_utc",
-                    "strategy_id",
-                    "broker_order_id",
-                    "symbol",
-                    "action",
-                    "notional_usd",
-                    "qty_shares",
-                    "status",
-                    "dry_run",
-                    "reason",
-                ]
-                self.worksheet.append_row(headers)
-        except Exception as e:
-            log.warning("Could not verify or write Google Sheet headers: %s", e)
+    try:
+      row = [
+          datetime.now(timezone.utc).isoformat(),
+          STRATEGY_ID,
+          broker_order_id,
+          symbol,
+          action.upper(),
+          round(notional_usd, 2) if notional_usd else 0.0,
+          round(qty_shares, 4) if qty_shares else 0.0,
+          status,
+          dry_run,
+          reason,
+      ]
+      self.worksheet.append_row(row)
+      log.info(
+          "Successfully logged trade execution [Strategy: %s | OrderID: %s] to"
+          " Google Sheets.",
+          STRATEGY_ID,
+          broker_order_id,
+      )
+    except Exception as e:
+      log.error("Failed to append trade record to Google Sheet: %s", e)
 
-    def log_execution(
-        self,
-        broker_order_id: str,
-        symbol: str,
-        action: str,
-        notional_usd: float,
-        qty_shares: float,
-        status: str,
-        dry_run: bool,
-        reason: str,
-    ):
-        if not self.worksheet:
-            log.warning("Skipping Google Sheets log entry (client not connected).")
-            return
 
-        try:
-            row = [
-                datetime.now(timezone.utc).isoformat(),
-                STRATEGY_ID,
-                broker_order_id,
-                symbol,
-                action.upper(),
-                round(notional_usd, 2) if notional_usd else 0.0,
-                round(qty_shares, 4) if qty_shares else 0.0,
-                status,
-                dry_run,
-                reason,
-            ]
-            self.worksheet.append_row(row)
-            log.info("Successfully logged trade execution [Strategy: %s | OrderID: %s] to Google Sheets.", STRATEGY_ID, broker_order_id)
-        except Exception as e:
-            log.error("Failed to append trade record to Google Sheet: %s", e)
+# ==========================================
+# 1c. MARKET HOLIDAY GUARD
+# ==========================================
+def is_market_open_today() -> bool:
+  """Checks if NYSE/NASDAQ is scheduled for an active trading session today."""
+  try:
+    nyse = xcal.get_calendar("XNYS")
+    today_str = datetime.now(ET).strftime("%Y-%m-%d")
+    return nyse.is_session(today_str)
+  except Exception as e:
+    log.warning("Could not check market calendar (%s); proceeding as open.", e)
+    return True
 
 
 # ==========================================
@@ -205,162 +235,174 @@ def fetch_weekly_bars(
     end: datetime,
     feed: DataFeed,
 ) -> pd.DataFrame:
-    """Fetch weekly bars for one symbol; returns a DataFrame indexed by timestamp."""
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Week,
-        start=start,
-        end=end,
-        feed=feed,
-        adjustment=Adjustment.ALL,  # split/dividend adjusted for indicator continuity
-    )
-    try:
-        bars = data_client.get_stock_bars(request)
-    except APIError as e:
-        raise StrategyError(f"API error fetching {symbol} bars: {e}") from e
+  """Fetch weekly bars for one symbol; returns a DataFrame indexed by timestamp."""
+  request = StockBarsRequest(
+      symbol_or_symbols=symbol,
+      timeframe=TimeFrame.Week,
+      start=start,
+      end=end,
+      feed=feed,
+      adjustment=Adjustment.ALL,  # split/dividend adjusted for indicator continuity
+  )
+  try:
+    bars = data_client.get_stock_bars(request)
+  except APIError as e:
+    raise StrategyError(f"API error fetching {symbol} bars: {e}") from e
 
-    df = bars.df  # build once
-    if df.empty or symbol not in df.index.get_level_values(0):
-        raise StrategyError(f"No data returned for {symbol}.")
+  df = bars.df  # build once
+  if df.empty or symbol not in df.index.get_level_values(0):
+    raise StrategyError(f"No data returned for {symbol}.")
 
-    return df.loc[symbol].sort_index().copy()
+  return df.loc[symbol].sort_index().copy()
 
 
 # ==========================================
 # 3. COMPLETED-WEEK LOGIC
 # ==========================================
 def week_monday(ts: pd.Timestamp) -> date:
-    """Monday (as a date) of the week a weekly bar belongs to.
+  """Monday (as a date) of the week a weekly bar belongs to.
 
-    Shifts +12h before converting to ET so the result is the same whether the feed
-    stamps weekly bars at Monday 00:00 UTC or Monday 00:00 ET.
-    """
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    ts_et = (ts + pd.Timedelta(hours=12)).tz_convert(ET)
-    return ts_et.date() - timedelta(days=ts_et.weekday())
+  Shifts +12h before converting to ET so the result is the same whether the feed
+  stamps weekly bars at Monday 00:00 UTC or Monday 00:00 ET.
+  """
+  if ts.tzinfo is None:
+    ts = ts.tz_localize("UTC")
+  ts_et = (ts + pd.Timedelta(hours=12)).tz_convert(ET)
+  return ts_et.date() - timedelta(days=ts_et.weekday())
 
 
 def last_complete_week_monday(now_et: datetime) -> date:
-    """Monday of the most recent weekly bar that should be fully closed right now."""
-    this_monday = now_et.date() - timedelta(days=now_et.weekday())
-    this_week_close = datetime.combine(
-        this_monday + timedelta(days=4), WEEK_CLOSE_TIME, tzinfo=ET
-    )
-    return this_monday if now_et >= this_week_close else this_monday - timedelta(days=7)
+  """Monday of the most recent weekly bar that should be fully closed right now."""
+  this_monday = now_et.date() - timedelta(days=now_et.weekday())
+  this_week_close = datetime.combine(
+      this_monday + timedelta(days=4), WEEK_CLOSE_TIME, tzinfo=ET
+  )
+  return (
+      this_monday if now_et >= this_week_close else this_monday - timedelta(days=7)
+  )
 
 
 def keep_completed_weeks(df: pd.DataFrame, now_et: datetime) -> pd.DataFrame:
-    """Drop any in-progress week and verify the newest bar is the week we expect."""
-    expected = last_complete_week_monday(now_et)
-    mask = np.array([week_monday(ts) <= expected for ts in df.index])
-    df = df.loc[mask].copy()
+  """Drop any in-progress week and verify the newest bar is the week we expect."""
+  expected = last_complete_week_monday(now_et)
+  mask = np.array([week_monday(ts) <= expected for ts in df.index])
+  df = df.loc[mask].copy()
 
-    if df.empty:
-        raise StrategyError("No completed weekly bars available.")
+  if df.empty:
+    raise StrategyError("No completed weekly bars available.")
 
-    newest = week_monday(df.index[-1])
-    if newest != expected:
-        raise StrategyError(
-            f"Stale data: newest completed bar is week of {newest}, expected week of "
-            f"{expected}. Feed may be lagging; refusing to trade."
-        )
-    return df
+  newest = week_monday(df.index[-1])
+  if newest != expected:
+    raise StrategyError(
+        f"Stale data: newest completed bar is week of {newest}, expected week"
+        f" of {expected}. Feed may be lagging; refusing to trade."
+    )
+  return df
 
 
 # ==========================================
 # 4. INDICATORS & SIGNALS
 # ==========================================
 def calc_wilder_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)      # keeps NaN for the first row
-    loss = -delta.clip(upper=0)
+  delta = series.diff()
+  gain = delta.clip(lower=0)  # keeps NaN for the first row
+  loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
-    avg_loss = loss.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+  avg_gain = gain.ewm(
+      alpha=1 / window, adjust=False, min_periods=window
+  ).mean()
+  avg_loss = loss.ewm(
+      alpha=1 / window, adjust=False, min_periods=window
+  ).mean()
 
-    # x/0 -> inf -> RSI = 100 exactly; 0/0 -> NaN (undefined, treated as "not overbought")
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+  # x/0 -> inf -> RSI = 100 exactly; 0/0 -> NaN (undefined, treated as "not overbought")
+  with np.errstate(divide="ignore", invalid="ignore"):
+    rs = avg_gain / avg_loss
+  return 100 - (100 / (1 + rs))
 
 
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["EMA12"] = df["close"].ewm(span=12, adjust=False).mean()
-    df["EMA26"] = df["close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = df["EMA12"] - df["EMA26"]
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["RSI"] = calc_wilder_rsi(df["close"], window=14)
+  df = df.copy()
+  df["EMA12"] = df["close"].ewm(span=12, adjust=False).mean()
+  df["EMA26"] = df["close"].ewm(span=26, adjust=False).mean()
+  df["MACD"] = df["EMA12"] - df["EMA26"]
+  df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+  df["RSI"] = calc_wilder_rsi(df["close"], window=14)
 
-    macd_bullish = df["MACD"] > df["MACD_Signal"]
-    trend_bullish = df["EMA12"] > df["EMA26"]
-    overbought = df["RSI"] >= 70
+  macd_bullish = df["MACD"] > df["MACD_Signal"]
+  trend_bullish = df["EMA12"] > df["EMA26"]
+  overbought = df["RSI"] >= 70
 
-    buy_cond = macd_bullish & trend_bullish
-    sell_cond = (~trend_bullish) | (overbought & ~macd_bullish)
+  buy_cond = macd_bullish & trend_bullish
+  sell_cond = (~trend_bullish) | (overbought & ~macd_bullish)
 
-    df["signal"] = np.nan
-    df.loc[buy_cond, "signal"] = 1.0
-    df.loc[sell_cond, "signal"] = 0.0   # sell wins if both ever fired (they are exclusive)
+  df["signal"] = np.nan
+  df.loc[buy_cond, "signal"] = (
+      1.0
+  )
+  df.loc[sell_cond, "signal"] = (
+      0.0  # sell wins if both ever fired (they are exclusive)
+  )
 
-    # Persistent state: stays long/flat until the opposite condition fires.
-    df["state"] = df["signal"].ffill()
-    return df
+  # Persistent state: stays long/flat until the opposite condition fires.
+  df["state"] = df["signal"].ffill()
+  return df
 
 
 # ==========================================
 # 5. BROKER HELPERS
 # ==========================================
 def get_position_qty(client: TradingClient, symbol: str) -> float:
-    """Return share qty held (negative = short). Only a 404 means 'no position'."""
-    try:
-        qty = float(client.get_open_position(symbol).qty)
-    except APIError as e:
-        if getattr(e, "status_code", None) == 404:
-            return 0.0
-        raise
-    if 0 < qty < POSITION_DUST_THRESHOLD:
-        log.warning("Ignoring residual fractional position dust (%s shares)", qty)
-        return 0.0
-    return qty
+  """Return share qty held (negative = short). Only a 404 means 'no position'."""
+  try:
+    qty = float(client.get_open_position(symbol).qty)
+  except APIError as e:
+    if getattr(e, "status_code", None) == 404:
+      return 0.0
+    raise
+  if 0 < qty < POSITION_DUST_THRESHOLD:
+    log.warning("Ignoring residual fractional position dust (%s shares)", qty)
+    return 0.0
+  return qty
 
 
 def deployable_cash(account) -> float:
-    """Cash we are willing to deploy: never uses margin, never negative."""
-    cash = float(account.cash)
-    nmbp = getattr(account, "non_marginable_buying_power", None)
-    available = cash if nmbp is None else min(cash, float(nmbp))
-    return max(available, 0.0) * CASH_DEPLOYMENT_PCT
+  """Cash we are willing to deploy: never uses margin, never negative."""
+  cash = float(account.cash)
+  nmbp = getattr(account, "non_marginable_buying_power", None)
+  available = cash if nmbp is None else min(cash, float(nmbp))
+  return max(available, 0.0) * CASH_DEPLOYMENT_PCT
 
 
 def _status(order) -> str:
-    return str(getattr(order.status, "value", order.status))
+  return str(getattr(order.status, "value", order.status))
 
 
 def wait_for_order(client: TradingClient, order):
-    """Poll briefly for a terminal status. Returns the latest order object."""
-    latest = order
-    deadline = time.monotonic() + ORDER_POLL_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        latest = client.get_order_by_id(order.id)
-        if latest.status in TERMINAL_STATUSES:
-            break
-        time.sleep(2)
+  """Poll briefly for a terminal status. Returns the latest order object."""
+  latest = order
+  deadline = time.monotonic() + ORDER_POLL_TIMEOUT_SEC
+  while time.monotonic() < deadline:
+    latest = client.get_order_by_id(order.id)
+    if latest.status in TERMINAL_STATUSES:
+      break
+    time.sleep(2)
 
-    if latest.status not in TERMINAL_STATUSES:
-        log.warning(
-            "Order %s did not reach a terminal state within %ds (status: %s). "
-            "The next run's pending-order check will skip until it resolves.",
-            order.id, ORDER_POLL_TIMEOUT_SEC, _status(latest),
-        )
-    return latest
+  if latest.status not in TERMINAL_STATUSES:
+    log.warning(
+        "Order %s did not reach a terminal state within %ds (status: %s). "
+        "The next run's pending-order check will skip until it resolves.",
+        order.id,
+        ORDER_POLL_TIMEOUT_SEC,
+        _status(latest),
+    )
+  return latest
 
 
 def assert_order_ok(order, label: str) -> None:
-    """Raise (-> non-zero exit) if the order was rejected, canceled, or expired."""
-    if order.status in FAILED_STATUSES:
-        raise StrategyError(f"{label} order {order.id} ended as {_status(order)}")
+  """Raise (-> non-zero exit) if the order was rejected, canceled, or expired."""
+  if order.status in FAILED_STATUSES:
+    raise StrategyError(f"{label} order {order.id} ended as {_status(order)}")
 
 
 # ==========================================
@@ -373,315 +415,434 @@ def execute(
     dry_run: bool,
     exec_logger: GoogleSheetExecutionLogger,
 ) -> str:
-    """Places (or logs) the trade and returns a short human-readable outcome string."""
-    log.info("================ EXECUTION [Strategy ID: %s] ================", STRATEGY_ID)
+  """Places (or logs) the trade and returns a short human-readable outcome string."""
+  log.info(
+      "================ EXECUTION [Strategy ID: %s] ================",
+      STRATEGY_ID,
+  )
 
-    account = trading_client.get_account()
-    if account.trading_blocked or account.account_blocked:
-        raise StrategyError("Account is blocked from trading; aborting.")
+  account = trading_client.get_account()
+  if account.trading_blocked or account.account_blocked:
+    raise StrategyError("Account is blocked from trading; aborting.")
 
-    asset = trading_client.get_asset(TRADE_SYMBOL)
-    if not asset.tradable:
-        raise StrategyError(f"{TRADE_SYMBOL} is not tradable on this account.")
-    if not asset.fractionable:
-        raise StrategyError(f"{TRADE_SYMBOL} is not fractionable; notional orders unsupported.")
-
-    market_open = True
-    try:
-        market_open = bool(trading_client.get_clock().is_open)
-    except Exception as e:  # clock is informational only
-        log.warning("Could not check market clock: %s", e)
-    if not market_open:
-        log.warning("Market is CLOSED. Day orders will queue for the next open.")
-
-    qty = get_position_qty(trading_client, TRADE_SYMBOL)
-    log.info("Position: %s shares of %s", qty, TRADE_SYMBOL)
-    if qty < 0:
-        raise StrategyError(f"Unexpected SHORT position ({qty}) in {TRADE_SYMBOL}; aborting.")
-
-    open_orders = trading_client.get_orders(
-        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[TRADE_SYMBOL])
+  asset = trading_client.get_asset(TRADE_SYMBOL)
+  if not asset.tradable:
+    raise StrategyError(f"{TRADE_SYMBOL} is not tradable on this account.")
+  if not asset.fractionable:
+    raise StrategyError(
+        f"{TRADE_SYMBOL} is not fractionable; notional orders unsupported."
     )
-    if open_orders:
-        msg = (
-            f"{len(open_orders)} open {TRADE_SYMBOL} order(s) already pending; "
-            "skipping to avoid duplicates."
-        )
-        log.warning(msg)
-        return msg
 
-    log.info("Target state: %s | fresh buy: %s", "LONG" if target_long else "FLAT", fresh_buy)
+  market_open = True
+  try:
+    market_open = bool(trading_client.get_clock().is_open)
+  except Exception as e:  # clock is informational only
+    log.warning("Could not check market clock: %s", e)
+  if not market_open:
+    log.warning("Market is CLOSED. Day orders will queue for the next open.")
 
-    # ---- BUY ----
-    if target_long and qty == 0:
-        if ENTER_ONLY_ON_FRESH_BUY and not fresh_buy:
-            msg = "NO ACTION: flat, state is long but not a fresh buy (ENTER_ONLY_ON_FRESH_BUY)."
-            log.info(msg)
-            return msg
+  qty = get_position_qty(trading_client, TRADE_SYMBOL)
+  log.info("Position: %s shares of %s", qty, TRADE_SYMBOL)
+  if qty < 0:
+    raise StrategyError(
+        f"Unexpected SHORT position ({qty}) in {TRADE_SYMBOL}; aborting."
+    )
 
-        amount = round(deployable_cash(account), 2)
-        log.info("BUY signal. Deployable cash (%.0f%%): $%.2f", CASH_DEPLOYMENT_PCT * 100, amount)
+  open_orders = trading_client.get_orders(
+      filter=GetOrdersRequest(
+          status=QueryOrderStatus.OPEN, symbols=[TRADE_SYMBOL]
+      )
+  )
+  if open_orders:
+    msg = (
+        f"{len(open_orders)} open {TRADE_SYMBOL} order(s) already pending; "
+        "skipping to avoid duplicates."
+    )
+    log.warning(msg)
+    return msg
 
-        if amount < MIN_TRADE_AMOUNT:
-            msg = f"Trade amount ${amount:.2f} below minimum ${MIN_TRADE_AMOUNT:.2f}; not buying."
-            log.error(msg)
-            return msg
+  log.info(
+      "Target state: %s | fresh buy: %s",
+      "LONG" if target_long else "FLAT",
+      fresh_buy,
+  )
 
-        if dry_run:
-            dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
-            msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
-            log.info("%s | Simulated Order ID: %s", msg, dry_id)
-            exec_logger.log_execution(
-                broker_order_id=dry_id,
-                symbol=TRADE_SYMBOL,
-                action="BUY",
-                notional_usd=amount,
-                qty_shares=0.0,
-                status="DRY_RUN",
-                dry_run=True,
-                reason="Weekly MACD/EMA Bullish Signal",
-            )
-            return msg
+  # ---- BUY ----
+  if target_long and qty == 0:
+    if ENTER_ONLY_ON_FRESH_BUY and not fresh_buy:
+      msg = (
+          "NO ACTION: flat, state is long but not a fresh buy"
+          " (ENTER_ONLY_ON_FRESH_BUY)."
+      )
+      log.info(msg)
+      return msg
 
-        order = trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=TRADE_SYMBOL,
-                notional=amount,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,  # notional/fractional orders require DAY
-            )
-        )
-        log.info("Submitted BUY $%.2f %s | id=%s status=%s", amount, TRADE_SYMBOL, order.id, _status(order))
-        if market_open:
-            order = wait_for_order(trading_client, order)
-            log.info("BUY order status: %s (filled_qty=%s)", _status(order), order.filled_qty)
+    amount = round(deployable_cash(account), 2)
+    log.info(
+        "BUY signal. Deployable cash (%.0f%%): $%.2f",
+        CASH_DEPLOYMENT_PCT * 100,
+        amount,
+    )
 
-        assert_order_ok(order, "BUY")
+    if amount < MIN_TRADE_AMOUNT:
+      msg = (
+          f"Trade amount ${amount:.2f} below minimum ${MIN_TRADE_AMOUNT:.2f};"
+          " not buying."
+      )
+      log.error(msg)
+      return msg
 
-        exec_logger.log_execution(
-            broker_order_id=str(order.id),
+    if dry_run:
+      dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
+      msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
+      log.info("%s | Simulated Order ID: %s", msg, dry_id)
+      exec_logger.log_execution(
+          broker_order_id=dry_id,
+          symbol=TRADE_SYMBOL,
+          action="BUY",
+          notional_usd=amount,
+          qty_shares=0.0,
+          status="DRY_RUN",
+          dry_run=True,
+          reason="Weekly MACD/EMA Bullish Signal",
+      )
+      return msg
+
+    order = trading_client.submit_order(
+        MarketOrderRequest(
             symbol=TRADE_SYMBOL,
-            action="BUY",
-            notional_usd=amount,
-            qty_shares=float(order.filled_qty or 0.0),
-            status=_status(order),
-            dry_run=False,
-            reason="Weekly MACD/EMA Bullish Signal",
+            notional=amount,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,  # notional/fractional orders require DAY
         )
-        return f"BUY ${amount:.2f} of {TRADE_SYMBOL} | Order ID: {order.id} | Status: {_status(order)}"
+    )
+    log.info(
+        "Submitted BUY $%.2f %s | id=%s status=%s",
+        amount,
+        TRADE_SYMBOL,
+        order.id,
+        _status(order),
+    )
+    if market_open:
+      order = wait_for_order(trading_client, order)
+      log.info(
+          "BUY order status: %s (filled_qty=%s)",
+          _status(order),
+          order.filled_qty,
+      )
 
-    # ---- SELL ----
-    elif not target_long and qty > 0:
-        log.info("SELL signal. Closing entire %s position (%s shares).", TRADE_SYMBOL, qty)
+    assert_order_ok(order, "BUY")
 
-        if dry_run:
-            dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
-            msg = f"[DRY RUN] Would close position in {TRADE_SYMBOL} ({qty} shares)."
-            log.info("%s | Simulated Order ID: %s", msg, dry_id)
-            exec_logger.log_execution(
-                broker_order_id=dry_id,
-                symbol=TRADE_SYMBOL,
-                action="SELL",
-                notional_usd=0.0,
-                qty_shares=qty,
-                status="DRY_RUN",
-                dry_run=True,
-                reason="Weekly Trend Breakdown / Overbought Signal",
-            )
-            return msg
+    exec_logger.log_execution(
+        broker_order_id=str(order.id),
+        symbol=TRADE_SYMBOL,
+        action="BUY",
+        notional_usd=amount,
+        qty_shares=float(order.filled_qty or 0.0),
+        status=_status(order),
+        dry_run=False,
+        reason="Weekly MACD/EMA Bullish Signal",
+    )
+    return (
+        f"BUY ${amount:.2f} of {TRADE_SYMBOL} | Order ID: {order.id} | Status:"
+        f" {_status(order)}"
+    )
 
-        order = trading_client.close_position(TRADE_SYMBOL)
-        log.info("Submitted CLOSE %s | id=%s status=%s", TRADE_SYMBOL, order.id, _status(order))
-        if market_open:
-            order = wait_for_order(trading_client, order)
-            log.info("CLOSE order status: %s (filled_qty=%s)", _status(order), order.filled_qty)
+  # ---- SELL ----
+  elif not target_long and qty > 0:
+    log.info(
+        "SELL signal. Closing entire %s position (%s shares).", TRADE_SYMBOL, qty
+    )
 
-        assert_order_ok(order, "CLOSE")
+    if dry_run:
+      dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
+      msg = f"[DRY RUN] Would close position in {TRADE_SYMBOL} ({qty} shares)."
+      log.info("%s | Simulated Order ID: %s", msg, dry_id)
+      exec_logger.log_execution(
+          broker_order_id=dry_id,
+          symbol=TRADE_SYMBOL,
+          action="SELL",
+          notional_usd=0.0,
+          qty_shares=qty,
+          status="DRY_RUN",
+          dry_run=True,
+          reason="Weekly Trend Breakdown / Overbought Signal",
+      )
+      return msg
 
-        exec_logger.log_execution(
-            broker_order_id=str(order.id),
-            symbol=TRADE_SYMBOL,
-            action="SELL",
-            notional_usd=0.0,
-            qty_shares=qty,
-            status=_status(order),
-            dry_run=False,
-            reason="Weekly Trend Breakdown / Overbought Signal",
-        )
-        return f"SOLD entire {TRADE_SYMBOL} position ({qty} shares) | Order ID: {order.id} | Status: {_status(order)}"
+    order = trading_client.close_position(TRADE_SYMBOL)
+    log.info(
+        "Submitted CLOSE %s | id=%s status=%s",
+        TRADE_SYMBOL,
+        order.id,
+        _status(order),
+    )
+    if market_open:
+      order = wait_for_order(trading_client, order)
+      log.info(
+          "CLOSE order status: %s (filled_qty=%s)",
+          _status(order),
+          order.filled_qty,
+      )
 
-    # ---- HOLD ----
-    else:
-        msg = f"NO ACTION: target is {'LONG' if target_long else 'FLAT'} and position is {qty} shares."
-        log.info(msg)
-        return msg
+    assert_order_ok(order, "CLOSE")
+
+    exec_logger.log_execution(
+        broker_order_id=str(order.id),
+        symbol=TRADE_SYMBOL,
+        action="SELL",
+        notional_usd=0.0,
+        qty_shares=qty,
+        status=_status(order),
+        dry_run=False,
+        reason="Weekly Trend Breakdown / Overbought Signal",
+    )
+    return (
+        f"SOLD entire {TRADE_SYMBOL} position ({qty} shares) | Order ID:"
+        f" {order.id} | Status: {_status(order)}"
+    )
+
+  # ---- HOLD / NO ACTION ----
+  else:
+    msg = (
+        f"NO ACTION: target is {'LONG' if target_long else 'FLAT'} and position"
+        f" is {qty} shares."
+    )
+    log.info(msg)
+
+    # Log HOLD / NO ACTION state to Google Sheets for verification
+    hold_id = f"HOLD_{uuid.uuid4().hex[:8]}"
+    exec_logger.log_execution(
+        broker_order_id=hold_id,
+        symbol=TRADE_SYMBOL,
+        action="HOLD",
+        notional_usd=0.0,
+        qty_shares=qty,
+        status="NO_ACTION",
+        dry_run=dry_run,
+        reason=msg,
+    )
+    return msg
 
 
 # ==========================================
 # 6b. EMAIL NOTIFICATION
 # ==========================================
 def send_email_report(subject: str, body: str) -> None:
-    """Sends a plain-text email via Gmail SMTP using an app password."""
-    import smtplib
-    from email.mime.text import MIMEText
+  """Sends a plain-text email via Gmail SMTP using an app password."""
+  from email.mime.text import MIMEText
+  import smtplib
 
-    gmail_address = os.getenv("GMAIL_ADDRESS")
-    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
-    email_to = os.getenv("EMAIL_TO", gmail_address)
+  gmail_address = os.getenv("GMAIL_ADDRESS")
+  gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
+  email_to = os.getenv("EMAIL_TO", gmail_address)
 
-    if not gmail_address or not gmail_app_password:
-        log.warning("GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report.")
-        return
+  if not gmail_address or not gmail_app_password:
+    log.warning(
+        "GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report."
+    )
+    return
 
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = gmail_address
-    msg["To"] = email_to
+  msg = MIMEText(body)
+  msg["Subject"] = subject
+  msg["From"] = gmail_address
+  msg["To"] = email_to
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
-            server.login(gmail_address, gmail_app_password)
-            server.sendmail(gmail_address, [a.strip() for a in email_to.split(",")], msg.as_string())
-        log.info("Email report sent to %s", email_to)
-    except Exception as e:
-        # Never let an email failure crash the trading run.
-        log.warning("Failed to send email report: %s", e)
+  try:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+      server.login(gmail_address, gmail_app_password)
+      server.sendmail(
+          gmail_address,
+          [a.strip() for a in email_to.split(",")],
+          msg.as_string(),
+      )
+    log.info("Email report sent to %s", email_to)
+  except Exception as e:
+    # Never let an email failure crash the trading run.
+    log.warning("Failed to send email report: %s", e)
 
 
 # ==========================================
 # 7. MAIN
 # ==========================================
 def setup_logging() -> None:
-    log_file = os.getenv(
-        "LOG_FILE",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tqqq_weekly_bot.log"),
-    )
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
+  log_file = os.getenv(
+      "LOG_FILE",
+      os.path.join(
+          os.path.dirname(os.path.abspath(__file__)), "tqqq_weekly_bot.log"
+      ),
+  )
+  fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+  log.setLevel(logging.INFO)
+  log.handlers.clear()
 
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(fmt)
-    log.addHandler(stream)
+  stream = logging.StreamHandler(sys.stdout)
+  stream.setFormatter(fmt)
+  log.addHandler(stream)
 
-    try:
-        fh = logging.FileHandler(log_file)
-        fh.setFormatter(fmt)
-        log.addHandler(fh)
-    except OSError as e:
-        log.warning("Could not open log file %s: %s", log_file, e)
+  try:
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+  except OSError as e:
+    log.warning("Could not open log file %s: %s", log_file, e)
 
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Weekly QQQ-signal / TQQQ-trade bot (Alpaca).")
-    p.add_argument("--live", action="store_true", help="Trade the LIVE account (real money). Default is paper.")
-    p.add_argument("--dry-run", action="store_true", help="Compute and log the decision but place no orders.")
-    return p.parse_args(argv)
+  p = argparse.ArgumentParser(
+      description="Weekly QQQ-signal / TQQQ-trade bot (Alpaca)."
+  )
+  p.add_argument(
+      "--live",
+      action="store_true",
+      help="Trade the LIVE account (real money). Default is paper.",
+  )
+  p.add_argument(
+      "--dry-run",
+      action="store_true",
+      help="Compute and log the decision but place no orders.",
+  )
+  return p.parse_args(argv)
 
 
 def main(argv: Optional[list] = None) -> int:
-    args = parse_args(argv)
-    setup_logging()
+  args = parse_args(argv)
+  setup_logging()
 
-    exec_logger = GoogleSheetExecutionLogger()
-    mode = "PAPER" if not args.live else "*** LIVE ***"
-    run_stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
+  # ---- MARKET HOLIDAY GUARD ----
+  if not is_market_open_today():
+    today_stamp = datetime.now(ET).strftime("%Y-%m-%d")
+    log.info(
+        "Market is CLOSED today (%s). Exiting job safely with success code.",
+        today_stamp,
+    )
+    return 0
 
-    api_key = os.getenv("ALPACA_API_KEY")
-    secret_key = os.getenv("ALPACA_SECRET_KEY")
-    if not api_key or not secret_key:
-        log.error("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.")
-        send_email_report(
-            f"[{STRATEGY_ID}] ERROR ({run_stamp})",
-            "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.",
-        )
-        return 1
+  exec_logger = GoogleSheetExecutionLogger()
+  mode = "PAPER" if not args.live else "*** LIVE ***"
+  run_stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
 
-    paper = not args.live
-    log.info("Starting Strategy [%s] | mode=%s | dry_run=%s", STRATEGY_ID, mode, args.dry_run)
+  api_key = os.getenv("ALPACA_API_KEY")
+  secret_key = os.getenv("ALPACA_SECRET_KEY")
+  if not api_key or not secret_key:
+    log.error(
+        "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables."
+    )
+    send_email_report(
+        f"[{STRATEGY_ID}] ERROR ({run_stamp})",
+        "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.",
+    )
+    return 1
 
-    try:
-        feed = DataFeed(os.getenv("ALPACA_FEED", "iex").lower())
-    except ValueError:
-        log.error("Invalid ALPACA_FEED (use 'iex' or 'sip').")
-        send_email_report(f"[{STRATEGY_ID}] ERROR ({run_stamp})", "Invalid ALPACA_FEED env var (use 'iex' or 'sip').")
-        return 1
+  paper = not args.live
+  log.info(
+      "Starting Strategy [%s] | mode=%s | dry_run=%s",
+      STRATEGY_ID,
+      mode,
+      args.dry_run,
+  )
 
-    data_client = StockHistoricalDataClient(api_key, secret_key)
-    trading_client = TradingClient(api_key, secret_key, paper=paper)
+  try:
+    feed = DataFeed(os.getenv("ALPACA_FEED", "iex").lower())
+  except ValueError:
+    log.error("Invalid ALPACA_FEED (use 'iex' or 'sip').")
+    send_email_report(
+        f"[{STRATEGY_ID}] ERROR ({run_stamp})",
+        "Invalid ALPACA_FEED env var (use 'iex' or 'sip').",
+    )
+    return 1
 
-    try:
-        now_utc = datetime.now(timezone.utc)
-        start = now_utc - timedelta(days=365 * HISTORY_YEARS)
+  data_client = StockHistoricalDataClient(api_key, secret_key)
+  trading_client = TradingClient(api_key, secret_key, paper=paper)
 
-        log.info("Fetching %s weekly bars (%s feed)...", INDICATOR_SYMBOL, feed.value)
-        df = fetch_weekly_bars(data_client, INDICATOR_SYMBOL, start, now_utc, feed)
-        df = keep_completed_weeks(df, now_utc.astimezone(ET))
+  try:
+    now_utc = datetime.now(timezone.utc)
+    start = now_utc - timedelta(days=365 * HISTORY_YEARS)
 
-        if len(df) < MIN_BARS:
-            raise StrategyError(f"Only {len(df)} completed bars; need at least {MIN_BARS}.")
+    log.info(
+        "Fetching %s weekly bars (%s feed)...", INDICATOR_SYMBOL, feed.value
+    )
+    df = fetch_weekly_bars(data_client, INDICATOR_SYMBOL, start, now_utc, feed)
+    df = keep_completed_weeks(df, now_utc.astimezone(ET))
 
-        df = compute_signals(df)
-        state = df["state"].dropna()
-        if state.empty:
-            raise StrategyError("No valid signal generated from indicators.")
+    if len(df) < MIN_BARS:
+      raise StrategyError(
+          f"Only {len(df)} completed bars; need at least {MIN_BARS}."
+      )
 
-        latest_state = float(state.iloc[-1])
-        prev_state = float(state.iloc[-2]) if len(state) > 1 else np.nan
-        fresh_buy = latest_state == 1.0 and prev_state != 1.0
+    df = compute_signals(df)
+    state = df["state"].dropna()
+    if state.empty:
+      raise StrategyError("No valid signal generated from indicators.")
 
-        last = df.iloc[-1]
-        week_str = str(week_monday(df.index[-1]))
-        state_str = "LONG (BUY)" if latest_state == 1.0 else "FLAT (SELL/OUT)"
+    latest_state = float(state.iloc[-1])
+    prev_state = float(state.iloc[-2]) if len(state) > 1 else np.nan
+    fresh_buy = latest_state == 1.0 and prev_state != 1.0
 
-        indicator_summary = (
-            f"Strategy ID: {STRATEGY_ID}\n"
-            f"Week of {week_str}\n"
-            f"  Close:         {last['close']:.2f}\n"
-            f"  EMA12:         {last['EMA12']:.2f}\n"
-            f"  EMA26:         {last['EMA26']:.2f}\n"
-            f"  MACD:          {last['MACD']:.3f}\n"
-            f"  MACD Signal:   {last['MACD_Signal']:.3f}\n"
-            f"  RSI(14):       {last['RSI']:.1f}\n"
-            f"  Signal state: {state_str}\n"
-            f"  Fresh flip this week: {fresh_buy}"
-        )
-        log.info(
-            "Week of %s | close=%.2f EMA12=%.2f EMA26=%.2f MACD=%.3f Sig=%.3f RSI=%.1f | state=%s",
-            week_str, last["close"], last["EMA12"], last["EMA26"],
-            last["MACD"], last["MACD_Signal"], last["RSI"], state_str,
-        )
+    last = df.iloc[-1]
+    week_str = str(week_monday(df.index[-1]))
+    state_str = "LONG (BUY)" if latest_state == 1.0 else "FLAT (SELL/OUT)"
 
-        outcome = execute(
-            trading_client=trading_client,
-            target_long=(latest_state == 1.0),
-            fresh_buy=fresh_buy,
-            dry_run=args.dry_run,
-            exec_logger=exec_logger,
-        )
+    indicator_summary = (
+        f"Strategy ID: {STRATEGY_ID}\n"
+        f"Week of {week_str}\n"
+        f"  Close:         {last['close']:.2f}\n"
+        f"  EMA12:         {last['EMA12']:.2f}\n"
+        f"  EMA26:         {last['EMA26']:.2f}\n"
+        f"  MACD:          {last['MACD']:.3f}\n"
+        f"  MACD Signal:   {last['MACD_Signal']:.3f}\n"
+        f"  RSI(14):       {last['RSI']:.1f}\n"
+        f"  Signal state: {state_str}\n"
+        f"  Fresh flip this week: {fresh_buy}"
+    )
+    log.info(
+        "Week of %s | close=%.2f EMA12=%.2f EMA26=%.2f MACD=%.3f Sig=%.3f"
+        " RSI=%.1f | state=%s",
+        week_str,
+        last["close"],
+        last["EMA12"],
+        last["EMA26"],
+        last["MACD"],
+        last["MACD_Signal"],
+        last["RSI"],
+        state_str,
+    )
 
-        body = (
-            f"Run time: {run_stamp}\n"
-            f"Strategy ID: {STRATEGY_ID}\n"
-            f"Mode: {mode}{' (dry-run)' if args.dry_run else ''}\n\n"
-            f"{indicator_summary}\n\n"
-            f"Execution outcome:\n  {outcome}\n"
-        )
-        send_email_report(f"[{STRATEGY_ID}] {state_str.split()[0]} - {week_str}", body)
-        return 0
+    outcome = execute(
+        trading_client=trading_client,
+        target_long=(latest_state == 1.0),
+        fresh_buy=fresh_buy,
+        dry_run=args.dry_run,
+        exec_logger=exec_logger,
+    )
 
-    except StrategyError as e:
-        log.error("ABORTED: %s", e)
-        send_email_report(f"[{STRATEGY_ID}] ABORTED ({run_stamp})", f"Run time: {run_stamp}\nMode: {mode}\n\nABORTED: {e}")
-        return 1
-    except Exception as e:
-        log.exception("Unhandled error")
-        send_email_report(
-            f"[{STRATEGY_ID}] UNHANDLED ERROR ({run_stamp})",
-            f"Run time: {run_stamp}\nMode: {mode}\n\nUnhandled error: {e}",
-        )
-        return 1
+    body = (
+        f"Run time: {run_stamp}\n"
+        f"Strategy ID: {STRATEGY_ID}\n"
+        f"Mode: {mode}{' (dry-run)' if args.dry_run else ''}\n\n"
+        f"{indicator_summary}\n\n"
+        f"Execution outcome:\n  {outcome}\n"
+    )
+    send_email_report(
+        f"[{STRATEGY_ID}] {state_str.split()[0]} - {week_str}", body
+    )
+    return 0
+
+  except StrategyError as e:
+    log.error("ABORTED: %s", e)
+    send_email_report(
+        f"[{STRATEGY_ID}] ABORTED ({run_stamp})",
+        f"Run time: {run_stamp}\nMode: {mode}\n\nABORTED: {e}",
+    )
+    return 1
+  except Exception as e:
+    log.exception("Unhandled error")
+    send_email_report(
+        f"[{STRATEGY_ID}] UNHANDLED ERROR ({run_stamp})",
+        f"Run time: {run_stamp}\nMode: {mode}\n\nUnhandled error: {e}",
+    )
+    return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+  sys.exit(main())
