@@ -11,7 +11,7 @@ Usage:
     export ALPACA_API_KEY=...
     export ALPACA_SECRET_KEY=...
     export GOOGLE_SHEET_ID=...
-    export GOOGLE_SERVICE_ACCOUNT_JSON='{"type": "service_account", ...}'
+    export GOOGLE_CREDENTIALS_B64='ewogICJ0eXBlIjogInNlcnZpY2VfYWNjb3VudCIs...'
 
     python rotation_bot.py           # Runs in PAPER mode
     python rotation_bot.py --live    # Runs in LIVE mode
@@ -98,35 +98,30 @@ class GoogleSheetExecutionLogger:
 
     def __init__(self):
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        self.creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        self.creds_b64 = os.getenv("GOOGLE_CREDENTIALS_B64")
         self.worksheet = None
 
-        if not self.sheet_id or not self.creds_json:
+        if not self.sheet_id or not self.creds_b64:
             _log(
-                "WARNING: GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set."
+                "WARNING: GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS_B64 not set."
                 " Google Sheets logging disabled."
             )
             return
 
         try:
-            raw_json = self.creds_json.strip()
+            raw_b64 = self.creds_b64.strip()
 
-            if (raw_json.startswith('"') and raw_json.endswith('"')) or (
-                raw_json.startswith("'") and raw_json.endswith("'")
+            # Strip outer quotes if passed with enclosing quotes
+            if (raw_b64.startswith('"') and raw_b64.endswith('"')) or (
+                raw_b64.startswith("'") and raw_b64.endswith("'")
             ):
-                raw_json = raw_json[1:-1].strip()
+                raw_b64 = raw_b64[1:-1].strip()
 
-            if not raw_json.startswith("{"):
-                try:
-                    raw_json = base64.b64decode(raw_json).decode("utf-8").strip()
-                except Exception:
-                    pass
+            # Decode Base64 string to raw JSON
+            decoded_json = base64.b64decode(raw_b64).decode("utf-8").strip()
 
-            try:
-                creds_dict = json.loads(raw_json)
-            except json.JSONDecodeError:
-                cleaned_json = raw_json.replace("\n", "\\n")
-                creds_dict = json.loads(cleaned_json)
+            # Parse JSON dictionary
+            creds_dict = json.loads(decoded_json)
 
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
