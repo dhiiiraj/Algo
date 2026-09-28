@@ -72,20 +72,15 @@ if not API_KEY or not SECRET_KEY:
     _log("Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in the environment.")
     sys.exit(1)
 
-# Set to False when going live with real money via command line flag
 PAPER = not args.live
 
-# SET YOUR HARDCODED CASH ALLOCATION LIMIT HERE (in USD)
 MAX_BUDGET = 100.00
-
-# Minimum rows of daily history required before trusting the 200-day SMA
 MIN_ROWS = 200
 
 TICKERS = ["TQQQ", "SOXL", "SQQQ", "BSV", "UVXY", "TECL"]
 
 ET = ZoneInfo("America/New_York")
 
-# Initialize Alpaca API Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
@@ -116,6 +111,11 @@ class GoogleSheetExecutionLogger:
                 raw_b64.startswith("'") and raw_b64.endswith("'")
             ):
                 raw_b64 = raw_b64[1:-1].strip()
+
+            # Fix Base64 padding if length is not a multiple of 4
+            missing_padding = len(raw_b64) % 4
+            if missing_padding:
+                raw_b64 += "=" * (4 - missing_padding)
 
             # Decode Base64 string to raw JSON
             decoded_json = base64.b64decode(raw_b64).decode("utf-8").strip()
