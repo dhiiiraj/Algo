@@ -15,10 +15,6 @@ Usage:
     python tqqq_weekly_bot.py --dry-run      # paper account, log decision only
     python tqqq_weekly_bot.py                # paper account, places orders
     python tqqq_weekly_bot.py --live         # REAL MONEY, places orders
-
-Optional env vars:
-    ALPACA_FEED              iex (default) | sip
-    LOG_FILE                 path to log file (default: tqqq_weekly_bot.log next to script)
 """
 
 import argparse
@@ -63,7 +59,6 @@ MIN_BARS = 104  # minimum completed weekly bars required
 CASH_DEPLOYMENT_PCT = 0.95  # fraction of available cash to deploy on a BUY
 MIN_TRADE_AMOUNT = 10.0  # self-imposed floor in USD
 
-# Ignore residual long fractional shares below this threshold to avoid false "held" states
 POSITION_DUST_THRESHOLD = 0.001
 
 ENTER_ONLY_ON_FRESH_BUY = False
@@ -119,6 +114,11 @@ class GoogleSheetExecutionLogger:
                 raw_b64.startswith("'") and raw_b64.endswith("'")
             ):
                 raw_b64 = raw_b64[1:-1].strip()
+
+            # Fix Base64 padding if length is not a multiple of 4
+            missing_padding = len(raw_b64) % 4
+            if missing_padding:
+                raw_b64 += "=" * (4 - missing_padding)
 
             # Decode Base64 string to raw JSON
             decoded_json = base64.b64decode(raw_b64).decode("utf-8").strip()
