@@ -123,6 +123,10 @@ class GoogleSheetExecutionLogger:
             # Parse JSON dictionary
             creds_dict = json.loads(decoded_json)
 
+            # Fix escaped newlines in private key if present
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
