@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
-"""Daily QQQ-signal / TQQQ-trade bot (Alpaca) with Google Sheets Execution Logging & Virtual Strategy Tracking.
+"""Multi-Asset Rotation Bot (Alpaca) with Google Sheets Execution Logging & Virtual Strategy Tracking.
 
-Signal (computed on COMPLETED daily QQQ bars only):
-    BUY  state : Close > SMA20  AND  SMA20 > SMA50
-    SELL state : Close <= SMA50
-    Otherwise  : keep the previous state (hysteresis).
+Strategy:
+    Evaluates Composer-style 200SMA, 20SMA, and 10-period RSI signals across
+    TQQQ, SOXL, SQQQ, BSV, UVXY, and TECL to select a single target ticker.
+    Liquidates out-of-strategy positions and enters the target asset up to
+    MAX_BUDGET.
 
 Usage:
     export ALPACA_API_KEY=...
     export ALPACA_SECRET_KEY=...
     export GOOGLE_SHEET_ID=...
-    export GOOGLE_CREDENTIALS_B64='ewogICJ0eXBlIjogInNlcnZpY2VfYWNjb3VudCIs...'
-    export STRATEGY_CAPITAL=5000.00          # Dedicated capital for this strategy
+    export GOOGLE_SERVICE_ACCOUNT_JSON='{"type": "service_account", ...}'
 
-    python tqqq_daily_bot.py --dry-run      # paper account, log decision only
-    python tqqq_daily_bot.py                # paper account, places orders
-    python tqqq_daily_bot.py --live         # REAL MONEY, places orders
+    python rotation_bot.py           # Runs in PAPER mode
+    python rotation_bot.py --live    # Runs in LIVE mode
 """
 
 import argparse
 import base64
 import json
-import logging
 import os
 import sys
 import time
 import uuid
-from datetime import date, datetime, timedelta, timezone
-from datetime import time as dtime
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcal
@@ -37,95 +33,100 @@ from google.oauth2.service_account import Credentials
 import numpy as np
 import pandas as pd
 
-from alpaca.common.exceptions import APIError
-from alpaca.data.enums import Adjustment, DataFeed
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & CREDENTIALS
 # ==========================================
-STRATEGY_ID = "TQQQ_DAILY_SMA_V1"  # Unique Strategy ID for trade tracking
+STRATEGY_ID = "COMPOSER_ROTATION_V1"  # Unique Strategy ID for trade tracking
 
-INDICATOR_SYMBOL = "QQQ"
-TRADE_SYMBOL = "TQQQ"
+# Collects human-readable lines during this run for the end-of-run email report.
+RUN_LOG: list[str] = []
 
-HISTORY_DAYS = 365  # daily history to pull for indicator warm-up
-MIN_BARS = 60  # minimum completed daily bars required
 
-MIN_TRADE_AMOUNT = 9000.0  # self-imposed floor in USD
+def _log(line: str) -> None:
+    """Print + remember a line so it can go into the email report too."""
+    print(line)
+    RUN_LOG.append(line)
 
-# Hardcoded Strategy Capital (overridden by env var STRATEGY_CAPITAL if set)
-STRATEGY_CAPITAL_ALLOCATION = float(os.getenv("STRATEGY_CAPITAL", "5000.00"))
 
-POSITION_DUST_THRESHOLD = 0.001
+def parse_args():
+    parser = argparse.ArgumentParser(description="Multi-Asset Rotation Bot")
+    parser.add_argument("--live", action="store_true", help="Run in LIVE trading mode")
+    return parser.parse_args()
 
-ENTER_ONLY_ON_FRESH_BUY = False
+
+args = parse_args()
+
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+if not API_KEY or not SECRET_KEY:
+    _log("ERROR: Missing Alpaca API credentials.")
+    _log("Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in the environment.")
+    sys.exit(1)
+
+# Set to False when going live with real money via command line flag
+PAPER = not args.live
+
+# SET YOUR HARDCODED CASH ALLOCATION LIMIT HERE (in USD)
+MAX_BUDGET = float(os.getenv("STRATEGY_CAPITAL", "5000.00"))
+
+# Minimum rows of daily history required before trusting the 200-day SMA
+MIN_ROWS = 200
+
+TICKERS = ["TQQQ", "SOXL", "SQQQ", "BSV", "UVXY", "TECL"]
 
 ET = ZoneInfo("America/New_York")
-MARKET_CLOSE_TIME = dtime(16, 0)
 
-ORDER_POLL_TIMEOUT_SEC = 20
-
-TERMINAL_STATUSES = {
-    OrderStatus.FILLED,
-    OrderStatus.CANCELED,
-    OrderStatus.EXPIRED,
-    OrderStatus.REJECTED,
-    OrderStatus.DONE_FOR_DAY,
-}
-FAILED_STATUSES = {
-    OrderStatus.REJECTED,
-    OrderStatus.CANCELED,
-    OrderStatus.EXPIRED,
-}
-
-log = logging.getLogger("tqqq_daily_bot")
-
-
-class StrategyError(Exception):
-    """Expected, non-recoverable problem (bad data, blocked account, etc.)."""
+# Initialize Alpaca API Clients
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 
 # ==========================================
 # 1b. GOOGLE SHEETS EXECUTION LOGGER
 # ==========================================
 class GoogleSheetExecutionLogger:
-    """Logs trade executions and maintains strategy-level virtual positions."""
+    """Logs trade executions directly to a live Google Sheet using gspread."""
 
     def __init__(self):
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        self.creds_b64 = os.getenv("GOOGLE_CREDENTIALS_B64")
+        self.creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
         self.worksheet = None
 
-        if not self.sheet_id or not self.creds_b64:
-            log.warning(
-                "GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS_B64 not set. Google"
-                " Sheets logging disabled."
+        if not self.sheet_id or not self.creds_json:
+            _log(
+                "WARNING: GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set."
+                " Google Sheets logging disabled."
             )
             return
 
         try:
-            raw_b64 = self.creds_b64.strip()
+            raw_json = self.creds_json.strip()
 
-            if (raw_b64.startswith('"') and raw_b64.endswith('"')) or (
-                raw_b64.startswith("'") and raw_b64.endswith("'")
+            if (raw_json.startswith('"') and raw_json.endswith('"')) or (
+                raw_json.startswith("'") and raw_json.endswith("'")
             ):
-                raw_b64 = raw_b64[1:-1].strip()
+                raw_json = raw_json[1:-1].strip()
 
-            missing_padding = len(raw_b64) % 4
-            if missing_padding:
-                raw_b64 += "=" * (4 - missing_padding)
+            if not raw_json.startswith("{"):
+                try:
+                    raw_json = base64.b64decode(raw_json).decode("utf-8").strip()
+                except Exception:
+                    pass
 
-            decoded_json = base64.b64decode(raw_b64).decode("utf-8").strip()
-            creds_dict = json.loads(decoded_json)
-
-            if "private_key" in creds_dict:
-                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            try:
+                creds_dict = json.loads(raw_json)
+            except json.JSONDecodeError:
+                cleaned_json = raw_json.replace("\n", "\\n")
+                creds_dict = json.loads(cleaned_json)
 
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
@@ -136,7 +137,7 @@ class GoogleSheetExecutionLogger:
             self.worksheet = client.open_by_key(self.sheet_id).sheet1
             self._ensure_headers()
         except Exception as e:
-            log.error("Failed to connect to Google Sheets: %s", e)
+            _log(f"ERROR: Failed to connect to Google Sheets: {e}")
             self.worksheet = None
 
     def _ensure_headers(self):
@@ -156,7 +157,7 @@ class GoogleSheetExecutionLogger:
                 ]
                 self.worksheet.append_row(headers)
         except Exception as e:
-            log.warning("Could not verify or write Google Sheet headers: %s", e)
+            _log(f"WARNING: Could not verify or write Google Sheet headers: {e}")
 
     def log_execution(
         self,
@@ -170,7 +171,7 @@ class GoogleSheetExecutionLogger:
         reason: str,
     ):
         if not self.worksheet:
-            log.warning("Skipping Google Sheets log entry (client not connected).")
+            _log("WARNING: Skipping Google Sheets log entry (client not connected).")
             return
 
         try:
@@ -187,380 +188,400 @@ class GoogleSheetExecutionLogger:
                 reason,
             ]
             self.worksheet.append_row(row)
-            log.info(
-                "Successfully logged trade execution [Strategy: %s | OrderID: %s] to"
-                " Google Sheets.",
-                STRATEGY_ID,
-                broker_order_id,
+            _log(
+                f"Successfully logged trade execution [Strategy: {STRATEGY_ID} |"
+                f" OrderID: {broker_order_id}] to Google Sheets."
             )
         except Exception as e:
-            log.error("Failed to append trade record to Google Sheet: %s", e)
+            _log(f"ERROR: Failed to append trade record to Google Sheet: {e}")
 
-    def get_strategy_position(self, symbol: str) -> float:
-        """Calculates net position for THIS strategy using filled logs from Google Sheets."""
-        if not self.worksheet:
-            log.warning("Sheet logging disabled; cannot deduce virtual position. Returning 0.0.")
-            return 0.0
 
-        try:
-            records = self.worksheet.get_all_records()
-            net_qty = 0.0
-            for r in records:
-                row_strat = str(r.get("strategy_id", "")).strip()
-                row_symbol = str(r.get("symbol", "")).strip()
-                row_status = str(r.get("status", "")).upper()
-                row_action = str(r.get("action", "")).upper()
-
-                if row_strat == STRATEGY_ID and row_symbol == symbol and row_status == "FILLED":
-                    try:
-                        shares = float(r.get("qty_shares", 0.0))
-                    except (ValueError, TypeError):
-                        shares = 0.0
-
-                    if row_action == "BUY":
-                        net_qty += shares
-                    elif row_action == "SELL":
-                        net_qty -= shares
-
-            if 0 < net_qty < POSITION_DUST_THRESHOLD:
-                return 0.0
-            return max(net_qty, 0.0)
-
-        except Exception as e:
-            log.error("Error reading virtual position from Google Sheets: %s", e)
-            return 0.0
+# Initialize Execution Logger
+exec_logger = GoogleSheetExecutionLogger()
 
 
 # ==========================================
 # 1c. MARKET HOLIDAY GUARD
 # ==========================================
 def is_market_open_today() -> bool:
-    """Checks if NYSE/NASDAQ is scheduled for an active trading session today."""
+    """Checks if the NYSE/NASDAQ is open for trading today."""
     try:
         nyse = xcal.get_calendar("XNYS")
         today_str = datetime.now(ET).strftime("%Y-%m-%d")
         return nyse.is_session(today_str)
     except Exception as e:
-        log.warning("Could not check market calendar (%s); proceeding as open.", e)
+        _log(f"WARNING: Could not check market calendar ({e}); proceeding.")
         return True
 
 
 # ==========================================
-# 2. DATA FETCHING
+# 2. INDICATOR LOGIC
 # ==========================================
-def fetch_daily_bars(
-    data_client: StockHistoricalDataClient,
-    symbol: str,
-    start: datetime,
-    end: datetime,
-    feed: DataFeed,
-) -> pd.DataFrame:
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Day,
-        start=start,
-        end=end,
-        feed=feed,
-        adjustment=Adjustment.ALL,
-    )
+def calc_composer_rsi10(series: pd.Series, window: int = 10) -> pd.Series:
+    """Calculates RSI using a Simple Moving Average (SMA) of gains/losses."""
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.rolling(window=window).mean()
+    avg_loss = loss.rolling(window=window).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.inf)
+    rsi = 100 - (100 / (1 + rs))
+    rsi[avg_loss == 0] = 100.0
+    return rsi
+
+
+# ==========================================
+# 3. MARKET DATA FETCHING
+# ==========================================
+def get_market_data(tickers: list[str]) -> pd.DataFrame:
+    """Fetches historical daily close prices required for 200 SMA calculation."""
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=400)
+
     try:
-        bars = data_client.get_stock_bars(request)
-    except APIError as e:
-        raise StrategyError(f"API error fetching {symbol} bars: {e}") from e
+        feed_type = DataFeed(os.getenv("ALPACA_FEED", "iex").lower())
+        request_params = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+            end=end_dt,
+            feed=feed_type,
+        )
+        barset = data_client.get_stock_bars(request_params)
+        bars = barset.df
+    except Exception as e:
+        _log(f"ERROR: Failed to fetch market data from Alpaca API: {e}")
+        sys.exit(1)
 
-    df = bars.df
-    if df.empty or symbol not in df.index.get_level_values(0):
-        raise StrategyError(f"No data returned for {symbol}.")
+    if bars.empty:
+        _log("ERROR: No market data returned for any ticker.")
+        sys.exit(1)
 
-    return df.loc[symbol].sort_index().copy()
+    bars_reset = bars.reset_index()
+    bars_reset["date"] = pd.to_datetime(bars_reset["timestamp"]).dt.date
 
+    _log("Per-symbol bar coverage in this window:")
+    coverage = bars_reset.groupby("symbol")["date"].agg(
+        count="count", first="min", last="max"
+    )
+    for symbol, row in coverage.iterrows():
+        _log(f"  {symbol}: {row['count']} bars, {row['first']} to {row['last']}")
 
-# ==========================================
-# 3. INDICATORS & SIGNALS
-# ==========================================
-def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["SMA20"] = df["close"].rolling(window=20).mean()
-    df["SMA50"] = df["close"].rolling(window=50).mean()
+    missing = [t for t in tickers if t not in coverage.index]
+    if missing:
+        _log(f"ERROR: No data returned at all for ticker(s): {missing}")
+        sys.exit(1)
 
-    buy_cond = (df["close"] > df["SMA20"]) & (df["SMA20"] > df["SMA50"])
-    sell_cond = df["close"] <= df["SMA50"]
+    df = bars_reset.pivot_table(
+        index="date", columns="symbol", values="close", aggfunc="last"
+    )
 
-    df["signal"] = np.nan
-    df.loc[buy_cond, "signal"] = 1.0
-    df.loc[sell_cond, "signal"] = 0.0
+    first_valid_per_symbol = df.apply(lambda col: col.first_valid_index())
+    if first_valid_per_symbol.isna().any():
+        bad = first_valid_per_symbol[first_valid_per_symbol.isna()].index.tolist()
+        _log(f"ERROR: Ticker(s) with zero valid close prices in this window: {bad}")
+        sys.exit(1)
 
-    df["state"] = df["signal"].ffill()
+    common_start = max(first_valid_per_symbol)
+    df = df.loc[df.index >= common_start]
+
+    df = df.ffill(limit=3)
+
+    missing = [t for t in tickers if t not in df.columns]
+    if missing:
+        _log(f"ERROR: No data returned for ticker(s): {missing}")
+        sys.exit(1)
+
+    remaining_nan_cols = df.columns[df.isna().any()].tolist()
+    if remaining_nan_cols:
+        _log(
+            f"ERROR: Gaps longer than 3 days remain in: {remaining_nan_cols}."
+            " Refusing to proceed on stale/interpolated data."
+        )
+        sys.exit(1)
+
+    if len(df) < MIN_ROWS:
+        _log(
+            f"ERROR: Insufficient price history returned ({len(df)} rows). Need at"
+            f" least {MIN_ROWS}."
+        )
+        sys.exit(1)
+
     return df
 
 
 # ==========================================
-# 4. BROKER HELPERS
+# 4. COMPOSER SIGNAL ENGINE
 # ==========================================
-def _status(order) -> str:
-    return str(getattr(order.status, "value", order.status))
+def evaluate_signal(df: pd.DataFrame) -> tuple[str, str]:
+    """Evaluates the strategy logic using the latest daily price data."""
+    df_calc = df.copy()
+    df_calc["TQQQ_200SMA"] = df_calc["TQQQ"].rolling(200).mean()
+    df_calc["TQQQ_20SMA"] = df_calc["TQQQ"].rolling(20).mean()
 
+    df_calc["TQQQ_RSI10"] = calc_composer_rsi10(df_calc["TQQQ"], 10)
+    df_calc["SOXL_RSI10"] = calc_composer_rsi10(df_calc["SOXL"], 10)
+    df_calc["SQQQ_RSI10"] = calc_composer_rsi10(df_calc["SQQQ"], 10)
+    df_calc["BSV_RSI10"] = calc_composer_rsi10(df_calc["BSV"], 10)
 
-def wait_for_order(client: TradingClient, order):
-    latest = order
-    deadline = time.monotonic() + ORDER_POLL_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        latest = client.get_order_by_id(order.id)
-        if latest.status in TERMINAL_STATUSES:
-            break
-        time.sleep(2)
+    latest = df_calc.iloc[-1]
 
-    if latest.status not in TERMINAL_STATUSES:
-        log.warning(
-            "Order %s did not reach a terminal state within %ds (status: %s).",
-            order.id,
-            ORDER_POLL_TIMEOUT_SEC,
-            _status(latest),
-        )
-    return latest
-
-
-def assert_order_ok(order, label: str) -> None:
-    if order.status in FAILED_STATUSES:
-        raise StrategyError(f"{label} order {order.id} ended as {_status(order)}")
-
-
-# ==========================================
-# 5. EXECUTION
-# ==========================================
-def execute(
-    trading_client: TradingClient,
-    target_long: bool,
-    fresh_buy: bool,
-    dry_run: bool,
-    exec_logger: GoogleSheetExecutionLogger,
-) -> str:
-    log.info(
-        "================ EXECUTION [Strategy ID: %s] ================",
-        STRATEGY_ID,
-    )
-
-    account = trading_client.get_account()
-    if account.trading_blocked or account.account_blocked:
-        raise StrategyError("Account is blocked from trading; aborting.")
-
-    asset = trading_client.get_asset(TRADE_SYMBOL)
-    if not asset.tradable:
-        raise StrategyError(f"{TRADE_SYMBOL} is not tradable on this account.")
-    if not asset.fractionable:
-        raise StrategyError(
-            f"{TRADE_SYMBOL} is not fractionable; notional orders unsupported."
-        )
-
-    market_open = True
-    try:
-        market_open = bool(trading_client.get_clock().is_open)
-    except Exception as e:
-        log.warning("Could not check market clock: %s", e)
-    if not market_open:
-        log.warning("Market is CLOSED. Day orders will queue for the next open.")
-
-    # 1. Check virtual position tracking specifically for STRATEGY_ID
-    qty = exec_logger.get_strategy_position(TRADE_SYMBOL)
-    log.info("Strategy [%s] Tracked Position: %s shares of %s", STRATEGY_ID, qty, TRADE_SYMBOL)
-
-    open_orders = trading_client.get_orders(
-        filter=GetOrdersRequest(
-            status=QueryOrderStatus.OPEN, symbols=[TRADE_SYMBOL]
-        )
-    )
-    # Check if open order belongs to this strategy via client_order_id prefix
-    strat_open_orders = [
-        o for o in open_orders if str(o.client_order_id).startswith(STRATEGY_ID)
+    required_fields = [
+        "TQQQ",
+        "TQQQ_200SMA",
+        "TQQQ_20SMA",
+        "TQQQ_RSI10",
+        "SOXL_RSI10",
+        "SQQQ_RSI10",
+        "BSV_RSI10",
     ]
-    if strat_open_orders:
-        msg = (
-            f"{len(strat_open_orders)} open {TRADE_SYMBOL} order(s) already pending for "
-            f"strategy {STRATEGY_ID}; skipping to avoid duplicates."
-        )
-        log.warning(msg)
-        return msg
+    nan_fields = [f for f in required_fields if pd.isna(latest[f])]
+    if nan_fields:
+        _log(f"ERROR: Cannot evaluate signal, NaN values present in: {nan_fields}")
+        sys.exit(1)
 
-    log.info(
-        "Target state: %s | fresh buy: %s",
-        "LONG" if target_long else "FLAT",
-        fresh_buy,
-    )
+    tqqq_price = latest["TQQQ"]
+    tqqq_200sma = latest["TQQQ_200SMA"]
+    tqqq_rsi10 = latest["TQQQ_RSI10"]
 
-    # ---- BUY ----
-    if target_long and qty == 0:
-        if ENTER_ONLY_ON_FRESH_BUY and not fresh_buy:
-            msg = (
-                "NO ACTION: flat, state is long but not a fresh buy"
-                " (ENTER_ONLY_ON_FRESH_BUY)."
+    if tqqq_price > tqqq_200sma:
+        if tqqq_rsi10 > 79:
+            reason = (
+                f"TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) > 79 -> extremely"
+                " overbought -> UVXY"
             )
-            log.info(msg)
-            return msg
-
-        # Trade amount set directly to hardcoded strategy capital allocation
-        amount = round(STRATEGY_CAPITAL_ALLOCATION, 2)
-        log.info(
-            "BUY signal. Deploying full strategy allocation: $%.2f",
-            amount,
-        )
-
-        if amount < MIN_TRADE_AMOUNT:
-            msg = (
-                f"Trade amount ${amount:.2f} below minimum ${MIN_TRADE_AMOUNT:.2f};"
-                " not buying."
+            _log(f"BRANCH: {reason}")
+            return "UVXY", reason
+        else:
+            reason = (
+                f"TQQQ > 200SMA and RSI10 ({tqqq_rsi10:.1f}) <= 79 -> uptrend intact"
+                " -> TQQQ"
             )
-            log.error(msg)
-            return msg
-
-        client_order_id = f"{STRATEGY_ID}_BUY_{uuid.uuid4().hex[:8]}"
-
-        if dry_run:
-            msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
-            log.info("%s | Client Order ID: %s", msg, client_order_id)
-            exec_logger.log_execution(
-                broker_order_id=client_order_id,
-                symbol=TRADE_SYMBOL,
-                action="BUY",
-                notional_usd=amount,
-                qty_shares=0.0,
-                status="DRY_RUN",
-                dry_run=True,
-                reason="Daily SMA20/50 Bullish Trend Signal",
-            )
-            return msg
-
-        order = trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=TRADE_SYMBOL,
-                notional=amount,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                client_order_id=client_order_id,
-            )
-        )
-        log.info(
-            "Submitted BUY $%.2f %s | client_id=%s | order_id=%s | status=%s",
-            amount,
-            TRADE_SYMBOL,
-            client_order_id,
-            order.id,
-            _status(order),
-        )
-        if market_open:
-            order = wait_for_order(trading_client, order)
-            log.info(
-                "BUY order status: %s (filled_qty=%s)",
-                _status(order),
-                order.filled_qty,
-            )
-
-        assert_order_ok(order, "BUY")
-
-        exec_logger.log_execution(
-            broker_order_id=str(order.id),
-            symbol=TRADE_SYMBOL,
-            action="BUY",
-            notional_usd=amount,
-            qty_shares=float(order.filled_qty or 0.0),
-            status=_status(order),
-            dry_run=False,
-            reason="Daily SMA20/50 Bullish Trend Signal",
-        )
-        return (
-            f"BUY ${amount:.2f} of {TRADE_SYMBOL} | Order ID: {order.id} | Status:"
-            f" {_status(order)}"
-        )
-
-    # ---- SELL ----
-    elif not target_long and qty > 0:
-        log.info(
-            "SELL signal. Closing strategy position (%s shares of %s).", qty, TRADE_SYMBOL
-        )
-        client_order_id = f"{STRATEGY_ID}_SELL_{uuid.uuid4().hex[:8]}"
-
-        if dry_run:
-            msg = f"[DRY RUN] Would SELL {qty} shares of {TRADE_SYMBOL}."
-            log.info("%s | Client Order ID: %s", msg, client_order_id)
-            exec_logger.log_execution(
-                broker_order_id=client_order_id,
-                symbol=TRADE_SYMBOL,
-                action="SELL",
-                notional_usd=0.0,
-                qty_shares=qty,
-                status="DRY_RUN",
-                dry_run=True,
-                reason="Daily SMA50 Breakdown Signal",
-            )
-            return msg
-
-        order = trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=TRADE_SYMBOL,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-                client_order_id=client_order_id,
-            )
-        )
-        log.info(
-            "Submitted SELL %s shares %s | client_id=%s | order_id=%s | status=%s",
-            qty,
-            TRADE_SYMBOL,
-            client_order_id,
-            order.id,
-            _status(order),
-        )
-        if market_open:
-            order = wait_for_order(trading_client, order)
-            log.info(
-                "SELL order status: %s (filled_qty=%s)",
-                _status(order),
-                order.filled_qty,
-            )
-
-        assert_order_ok(order, "SELL")
-
-        exec_logger.log_execution(
-            broker_order_id=str(order.id),
-            symbol=TRADE_SYMBOL,
-            action="SELL",
-            notional_usd=0.0,
-            qty_shares=float(order.filled_qty or qty),
-            status=_status(order),
-            dry_run=False,
-            reason="Daily SMA50 Breakdown Signal",
-        )
-        return (
-            f"SOLD strategy position of {qty} shares in {TRADE_SYMBOL} | Order ID:"
-            f" {order.id} | Status: {_status(order)}"
-        )
-
-    # ---- HOLD / NO ACTION ----
+            _log(f"BRANCH: {reason}")
+            return "TQQQ", reason
     else:
-        msg = (
-            f"NO ACTION: target is {'LONG' if target_long else 'FLAT'} and strategy position"
-            f" is {qty} shares."
-        )
-        log.info(msg)
+        if tqqq_rsi10 < 31:
+            reason = (
+                f"TQQQ <= 200SMA and RSI10 ({tqqq_rsi10:.1f}) < 31 -> oversold bounce"
+                " -> TECL"
+            )
+            _log(f"BRANCH: {reason}")
+            return "TECL", reason
+        else:
+            if latest["SOXL_RSI10"] < 30:
+                reason = (
+                    "downtrend, SOXL RSI10"
+                    f" ({latest['SOXL_RSI10']:.1f}) < 30 -> semis oversold -> SOXL"
+                )
+                _log(f"BRANCH: {reason}")
+                return "SOXL", reason
+            else:
+                if tqqq_price < latest["TQQQ_20SMA"]:
+                    if latest["SQQQ_RSI10"] >= latest["BSV_RSI10"]:
+                        reason = (
+                            "downtrend, TQQQ < 20SMA, SQQQ RSI10 "
+                            f"({latest['SQQQ_RSI10']:.1f}) >= BSV RSI10"
+                            f" ({latest['BSV_RSI10']:.1f}) -> SQQQ"
+                        )
+                        _log(f"BRANCH: {reason}")
+                        return "SQQQ", reason
+                    else:
+                        reason = (
+                            "downtrend, TQQQ < 20SMA, BSV RSI10 "
+                            f"({latest['BSV_RSI10']:.1f}) > SQQQ RSI10 "
+                            f"({latest['SQQQ_RSI10']:.1f}) -> BSV"
+                        )
+                        _log(f"BRANCH: {reason}")
+                        return "BSV", reason
+                else:
+                    reason = (
+                        "downtrend on 200SMA but TQQQ still above 20SMA -> stay long ->"
+                        " TQQQ"
+                    )
+                    _log(f"BRANCH: {reason}")
+                    return "TQQQ", reason
+
+
+# ==========================================
+# 5. EXECUTION & ORDER SYNCHRONIZATION HELPERS
+# ==========================================
+def wait_for_liquidation(
+    symbol: str, timeout: int = 15, poll_interval: float = 0.5
+) -> bool:
+    """Polls until the position is fully closed, or timeout (seconds) elapses."""
+    elapsed = 0.0
+    while elapsed < timeout:
+        try:
+            positions = {
+                p.symbol: float(p.qty) for p in trading_client.get_all_positions()
+            }
+        except Exception as e:
+            _log(f"WARNING: Failed to poll positions for {symbol}: {e}")
+            return False
+        if symbol not in positions:
+            return True
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+    _log(f"WARNING: Liquidation of {symbol} did not confirm within {timeout}s.")
+    return False
+
+
+# ==========================================
+# 6. REBALANCING ENGINE
+# ==========================================
+def rebalance(target_ticker: str, reason: str) -> str:
+    """Liquidates out-of-strategy positions and enters target position up to MAX_BUDGET."""
+    try:
+        positions = {
+            p.symbol: float(p.qty) for p in trading_client.get_all_positions()
+        }
+    except Exception as e:
+        _log(f"ERROR: Failed to retrieve account positions: {e}")
+        sys.exit(1)
+
+    _log("--- REBALANCE RUN STARTED ---")
+    _log(f"Strategy ID: {STRATEGY_ID}")
+    _log(f"Mode: {'PAPER' if PAPER else 'LIVE'}")
+    _log(f"Target Symbol: {target_ticker}")
+    _log(f"Current Portfolio Positions: {positions}")
+
+    target_qty = positions.get(target_ticker, 0)
+    if target_qty > 0 and all(
+        symbol == target_ticker for symbol in positions.keys()
+    ):
+        msg = f"NO ACTION: Already holding target asset ({target_ticker}) exclusively."
+        _log(msg)
 
         hold_id = f"HOLD_{uuid.uuid4().hex[:8]}"
         exec_logger.log_execution(
             broker_order_id=hold_id,
-            symbol=TRADE_SYMBOL,
+            symbol=target_ticker,
             action="HOLD",
             notional_usd=0.0,
-            qty_shares=qty,
+            qty_shares=target_qty,
             status="NO_ACTION",
-            dry_run=dry_run,
+            dry_run=False,
             reason=msg,
         )
         return msg
 
+    try:
+        symbols_in_play = list(set(list(positions.keys()) + [target_ticker]))
+        open_orders_request = GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, symbols=symbols_in_play
+        )
+        open_orders = trading_client.get_orders(filter=open_orders_request)
+        if open_orders:
+            msg = (
+                f"SKIP: {len(open_orders)} open order(s) already exist on"
+                f" {symbols_in_play}. Not rebalancing."
+            )
+            _log(msg)
+            return msg
+    except Exception as e:
+        _log(f"ERROR: Failed to check open orders: {e}")
+        sys.exit(1)
+
+    had_liquidations = any(symbol != target_ticker for symbol in positions.keys())
+
+    liquidation_failed = False
+    for symbol, qty in positions.items():
+        if symbol != target_ticker:
+            _log(f"Liquidating position: {symbol} ({qty} shares)...")
+            client_order_id = f"{STRATEGY_ID}_SELL_{uuid.uuid4().hex[:8]}"
+            try:
+                close_order = trading_client.submit_order(
+                    MarketOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY,
+                        client_order_id=client_order_id,
+                    )
+                )
+                order_id = str(close_order.id)
+                status = str(getattr(close_order.status, "value", close_order.status))
+
+                exec_logger.log_execution(
+                    broker_order_id=order_id,
+                    symbol=symbol,
+                    action="SELL",
+                    notional_usd=0.0,
+                    qty_shares=qty,
+                    status=status,
+                    dry_run=False,
+                    reason=f"Rotation away from {symbol} to {target_ticker}",
+                )
+            except Exception as e:
+                _log(f"ERROR: Failed to submit close position order for {symbol}: {e}")
+                liquidation_failed = True
+                continue
+
+            confirmed = wait_for_liquidation(symbol, timeout=15)
+            if not confirmed:
+                liquidation_failed = True
+
+    if liquidation_failed:
+        msg = (
+            "ERROR: One or more liquidations failed or timed out. Aborting before"
+            " entering a new position."
+        )
+        _log(msg)
+        sys.exit(1)
+
+    notional_amount = round(MAX_BUDGET, 2)
+    min_order_limit = 10.00  # Alpaca dollar limit for fractional orders
+
+    if notional_amount >= min_order_limit:
+        client_order_id = f"{STRATEGY_ID}_BUY_{uuid.uuid4().hex[:8]}"
+        market_order_data = MarketOrderRequest(
+            symbol=target_ticker,
+            notional=notional_amount,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
+        )
+        try:
+            buy_order = trading_client.submit_order(order_data=market_order_data)
+            order_id = str(buy_order.id)
+            status = str(getattr(buy_order.status, "value", buy_order.status))
+
+            exec_logger.log_execution(
+                broker_order_id=order_id,
+                symbol=target_ticker,
+                action="BUY",
+                notional_usd=notional_amount,
+                qty_shares=float(getattr(buy_order, "filled_qty", 0.0) or 0.0),
+                status=status,
+                dry_run=False,
+                reason=reason,
+            )
+
+            msg = (
+                f"Successfully submitted Market BUY order: ${notional_amount} of"
+                f" {target_ticker} | Order ID: {order_id}"
+            )
+            _log(msg)
+            return msg
+        except Exception as e:
+            _log(f"ERROR: Failed to submit order for {target_ticker}: {e}")
+            sys.exit(1)
+    else:
+        msg = (
+            f"Execution skipped: Calculated spend (${notional_amount}) is below"
+            f" Alpaca's ${min_order_limit} minimum requirement."
+        )
+        _log(msg)
+        return msg
+
 
 # ==========================================
-# 6. EMAIL NOTIFICATION
+# 6b. EMAIL NOTIFICATION
 # ==========================================
 def send_email_report(subject: str, body: str) -> None:
+    """Sends a plain-text email via Gmail SMTP using an app password."""
     from email.mime.text import MIMEText
     import smtplib
 
@@ -569,9 +590,7 @@ def send_email_report(subject: str, body: str) -> None:
     email_to = os.getenv("EMAIL_TO", gmail_address)
 
     if not gmail_address or not gmail_app_password:
-        log.warning(
-            "GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report."
-        )
+        _log("WARNING: GMAIL_ADDRESS / GMAIL_APP_PASSWORD not set; skipping email report.")
         return
 
     msg = MIMEText(body)
@@ -587,186 +606,51 @@ def send_email_report(subject: str, body: str) -> None:
                 [a.strip() for a in email_to.split(",")],
                 msg.as_string(),
             )
-        log.info("Email report sent to %s", email_to)
+        print(f"Email report sent to {email_to}")
     except Exception as e:
-        log.warning("Failed to send email report: %s", e)
+        print(f"WARNING: Failed to send email report: {e}")
 
 
 # ==========================================
-# 7. MAIN
+# 7. MAIN RUNNER
 # ==========================================
-def setup_logging() -> None:
-    log_file = os.getenv(
-        "LOG_FILE",
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "tqqq_daily_bot.log"
-        ),
-    )
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(fmt)
-    log.addHandler(stream)
-
-    try:
-        fh = logging.FileHandler(log_file)
-        fh.setFormatter(fmt)
-        log.addHandler(fh)
-    except OSError as e:
-        log.warning("Could not open log file %s: %s", log_file, e)
-
-
-def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Daily QQQ-signal / TQQQ-trade bot (Alpaca)."
-    )
-    p.add_argument(
-        "--live",
-        action="store_true",
-        help="Trade the LIVE account (real money). Default is paper.",
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Compute and log the decision but place no orders.",
-    )
-    return p.parse_args(argv)
-
-
-def main(argv: Optional[list] = None) -> int:
-    args = parse_args(argv)
-    setup_logging()
-
-    # ---- MARKET HOLIDAY GUARD ----
-    if not is_market_open_today():
-        today_stamp = datetime.now(ET).strftime("%Y-%m-%d")
-        log.info(
-            "Market is CLOSED today (%s). Exiting job safely with success code.",
-            today_stamp,
-        )
-        return 0
-
-    exec_logger = GoogleSheetExecutionLogger()
-    mode = "PAPER" if not args.live else "*** LIVE ***"
+if __name__ == "__main__":
     run_stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
 
-    api_key = os.getenv("ALPACA_API_KEY")
-    secret_key = os.getenv("ALPACA_SECRET_KEY")
-    if not api_key or not secret_key:
-        log.error(
-            "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables."
+    if not is_market_open_today():
+        today_stamp = datetime.now(ET).strftime("%Y-%m-%d")
+        _log(
+            f"Market is CLOSED today ({today_stamp}). Exiting job safely with"
+            " success code."
         )
-        send_email_report(
-            f"[{STRATEGY_ID}] ERROR ({run_stamp})",
-            "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY environment variables.",
-        )
-        return 1
-
-    paper = not args.live
-    log.info(
-        "Starting Strategy [%s] | Capital=$%.2f | mode=%s | dry_run=%s",
-        STRATEGY_ID,
-        STRATEGY_CAPITAL_ALLOCATION,
-        mode,
-        args.dry_run,
-    )
+        sys.exit(0)
 
     try:
-        feed = DataFeed(os.getenv("ALPACA_FEED", "iex").lower())
-    except ValueError:
-        log.error("Invalid ALPACA_FEED (use 'iex' or 'sip').")
-        send_email_report(
-            f"[{STRATEGY_ID}] ERROR ({run_stamp})",
-            "Invalid ALPACA_FEED env var (use 'sip' or 'iex').",
-        )
-        return 1
-
-    data_client = StockHistoricalDataClient(api_key, secret_key)
-    trading_client = TradingClient(api_key, secret_key, paper=paper)
-
-    try:
-        now_utc = datetime.now(timezone.utc)
-        start = now_utc - timedelta(days=HISTORY_DAYS)
-
-        log.info(
-            "Fetching %s daily bars (%s feed)...", INDICATOR_SYMBOL, feed.value
-        )
-        df = fetch_daily_bars(data_client, INDICATOR_SYMBOL, start, now_utc, feed)
-
-        if len(df) < MIN_BARS:
-            raise StrategyError(
-                f"Only {len(df)} completed daily bars; need at least {MIN_BARS}."
-            )
-
-        df = compute_signals(df)
-        state = df["state"].dropna()
-        if state.empty:
-            raise StrategyError("No valid signal generated from indicators.")
-
-        latest_state = float(state.iloc[-1])
-        prev_state = float(state.iloc[-2]) if len(state) > 1 else np.nan
-        fresh_buy = latest_state == 1.0 and prev_state != 1.0
-
-        last = df.iloc[-1]
-        date_str = str(df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1])
-        state_str = "LONG (BUY)" if latest_state == 1.0 else "FLAT (SELL/OUT)"
-
-        indicator_summary = (
-            f"Strategy ID: {STRATEGY_ID}\n"
-            f"Strategy Allocation: ${STRATEGY_CAPITAL_ALLOCATION:,.2f}\n"
-            f"Date: {date_str}\n"
-            f"  Close: {last['close']:.2f}\n"
-            f"  SMA20: {last['SMA20']:.2f}\n"
-            f"  SMA50: {last['SMA50']:.2f}\n"
-            f"  Signal state: {state_str}\n"
-            f"  Fresh flip today: {fresh_buy}"
-        )
-        log.info(
-            "Date %s | close=%.2f SMA20=%.2f SMA50=%.2f | state=%s",
-            date_str,
-            last["close"],
-            last["SMA20"],
-            last["SMA50"],
-            state_str,
-        )
-
-        outcome = execute(
-            trading_client=trading_client,
-            target_long=(latest_state == 1.0),
-            fresh_buy=fresh_buy,
-            dry_run=args.dry_run,
-            exec_logger=exec_logger,
-        )
+        market_data = get_market_data(TICKERS)
+        target_symbol, branch_reason = evaluate_signal(market_data)
+        outcome = rebalance(target_symbol, branch_reason)
 
         body = (
             f"Run time: {run_stamp}\n"
             f"Strategy ID: {STRATEGY_ID}\n"
-            f"Mode: {mode}{' (dry-run)' if args.dry_run else ''}\n\n"
-            f"{indicator_summary}\n\n"
-            f"Execution outcome:\n  {outcome}\n"
+            f"Mode: {'PAPER' if PAPER else 'LIVE'}\n\n"
+            f"Signal: {target_symbol}\n"
+            f"Reason: {branch_reason}\n\n"
+            f"Rebalance outcome:\n  {outcome}\n\n"
+            f"--- Full run log ---\n"
+            + "\n".join(RUN_LOG)
         )
-        send_email_report(
-            f"[{STRATEGY_ID}] {state_str.split()[0]} - {date_str}", body
-        )
-        return 0
+        send_email_report(f"[{STRATEGY_ID}] {target_symbol} - {run_stamp}", body)
 
-    except StrategyError as e:
-        log.error("ABORTED: %s", e)
-        send_email_report(
-            f"[{STRATEGY_ID}] ABORTED ({run_stamp})",
-            f"Run time: {run_stamp}\nMode: {mode}\n\nABORTED: {e}",
-        )
-        return 1
-    except Exception as e:
-        log.exception("Unhandled error")
-        send_email_report(
-            f"[{STRATEGY_ID}] UNHANDLED ERROR ({run_stamp})",
-            f"Run time: {run_stamp}\nMode: {mode}\n\nUnhandled error: {e}",
-        )
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    except SystemExit as e:
+        if e.code != 0:
+            body = (
+                f"Run time: {run_stamp}\n"
+                f"Strategy ID: {STRATEGY_ID}\n"
+                f"Mode: {'PAPER' if PAPER else 'LIVE'}\n\n"
+                f"Run FAILED before completing. See log below.\n\n"
+                f"--- Full run log ---\n"
+                + "\n".join(RUN_LOG)
+            )
+            send_email_report(f"[{STRATEGY_ID}] ERROR - {run_stamp}", body)
+        raise
