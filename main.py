@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weekly QQQ-signal / TQQQ-trade bot (Alpaca) with Google Sheets Execution Logging.
+"""Weekly QQQ-signal / TQQQ-trade bot (Alpaca) with Google Sheets Execution Logging & Virtual Strategy Tracking.
 
 Signal (computed on COMPLETED weekly QQQ bars only):
     BUY  state : MACD > MACD signal  AND  EMA12 > EMA26
@@ -11,6 +11,7 @@ Usage:
     export ALPACA_SECRET_KEY=...
     export GOOGLE_SHEET_ID=...
     export GOOGLE_CREDENTIALS_B64='ewogICJ0eXBlIjogInNlcnZpY2VfYWNjb3VudCIs...'
+    export STRATEGY_CAPITAL=5000.00          # Dedicated capital for this strategy
 
     python tqqq_weekly_bot.py --dry-run      # paper account, log decision only
     python tqqq_weekly_bot.py                # paper account, places orders
@@ -56,8 +57,10 @@ TRADE_SYMBOL = "TQQQ"
 HISTORY_YEARS = 8  # weekly history to pull (more = better indicator warm-up)
 MIN_BARS = 104  # minimum completed weekly bars required
 
-CASH_DEPLOYMENT_PCT = 0.95  # fraction of available cash to deploy on a BUY
-MIN_TRADE_AMOUNT = 10.0  # self-imposed floor in USD
+MIN_TRADE_AMOUNT = 10000.0  # self-imposed floor in USD
+
+# Hardcoded Strategy Capital (overridden by env var STRATEGY_CAPITAL if set)
+STRATEGY_CAPITAL_ALLOCATION = float(os.getenv("STRATEGY_CAPITAL", "5000.00"))
 
 POSITION_DUST_THRESHOLD = 0.001
 
@@ -92,7 +95,7 @@ class StrategyError(Exception):
 # 1b. GOOGLE SHEETS EXECUTION LOGGER
 # ==========================================
 class GoogleSheetExecutionLogger:
-    """Logs trade executions directly to a live Google Sheet using gspread."""
+    """Logs trade executions and maintains strategy-level virtual positions."""
 
     def __init__(self):
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
@@ -109,24 +112,18 @@ class GoogleSheetExecutionLogger:
         try:
             raw_b64 = self.creds_b64.strip()
 
-            # Strip outer quotes if passed with enclosing quotes
             if (raw_b64.startswith('"') and raw_b64.endswith('"')) or (
                 raw_b64.startswith("'") and raw_b64.endswith("'")
             ):
                 raw_b64 = raw_b64[1:-1].strip()
 
-            # Fix Base64 padding if length is not a multiple of 4
             missing_padding = len(raw_b64) % 4
             if missing_padding:
                 raw_b64 += "=" * (4 - missing_padding)
 
-            # Decode Base64 string to raw JSON
             decoded_json = base64.b64decode(raw_b64).decode("utf-8").strip()
-
-            # Parse JSON dictionary
             creds_dict = json.loads(decoded_json)
 
-            # Fix escaped newlines in private key if present
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
@@ -198,6 +195,40 @@ class GoogleSheetExecutionLogger:
             )
         except Exception as e:
             log.error("Failed to append trade record to Google Sheet: %s", e)
+
+    def get_strategy_position(self, symbol: str) -> float:
+        """Calculates net position for THIS strategy using filled logs from Google Sheets."""
+        if not self.worksheet:
+            log.warning("Sheet logging disabled; cannot deduce virtual position. Returning 0.0.")
+            return 0.0
+
+        try:
+            records = self.worksheet.get_all_records()
+            net_qty = 0.0
+            for r in records:
+                row_strat = str(r.get("strategy_id", "")).strip()
+                row_symbol = str(r.get("symbol", "")).strip()
+                row_status = str(r.get("status", "")).upper()
+                row_action = str(r.get("action", "")).upper()
+
+                if row_strat == STRATEGY_ID and row_symbol == symbol and row_status == "FILLED":
+                    try:
+                        shares = float(r.get("qty_shares", 0.0))
+                    except (ValueError, TypeError):
+                        shares = 0.0
+
+                    if row_action == "BUY":
+                        net_qty += shares
+                    elif row_action == "SELL":
+                        net_qty -= shares
+
+            if 0 < net_qty < POSITION_DUST_THRESHOLD:
+                return 0.0
+            return max(net_qty, 0.0)
+
+        except Exception as e:
+            log.error("Error reading virtual position from Google Sheets: %s", e)
+            return 0.0
 
 
 # ==========================================
@@ -327,26 +358,6 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
 # ==========================================
 # 5. BROKER HELPERS
 # ==========================================
-def get_position_qty(client: TradingClient, symbol: str) -> float:
-    try:
-        qty = float(client.get_open_position(symbol).qty)
-    except APIError as e:
-        if getattr(e, "status_code", None) == 404:
-            return 0.0
-        raise
-    if 0 < qty < POSITION_DUST_THRESHOLD:
-        log.warning("Ignoring residual fractional position dust (%s shares)", qty)
-        return 0.0
-    return qty
-
-
-def deployable_cash(account) -> float:
-    cash = float(account.cash)
-    nmbp = getattr(account, "non_marginable_buying_power", None)
-    available = cash if nmbp is None else min(cash, float(nmbp))
-    return max(available, 0.0) * CASH_DEPLOYMENT_PCT
-
-
 def _status(order) -> str:
     return str(getattr(order.status, "value", order.status))
 
@@ -410,22 +421,23 @@ def execute(
     if not market_open:
         log.warning("Market is CLOSED. Day orders will queue for the next open.")
 
-    qty = get_position_qty(trading_client, TRADE_SYMBOL)
-    log.info("Position: %s shares of %s", qty, TRADE_SYMBOL)
-    if qty < 0:
-        raise StrategyError(
-            f"Unexpected SHORT position ({qty}) in {TRADE_SYMBOL}; aborting."
-        )
+    # 1. Check virtual position tracking specifically for STRATEGY_ID
+    qty = exec_logger.get_strategy_position(TRADE_SYMBOL)
+    log.info("Strategy [%s] Tracked Position: %s shares of %s", STRATEGY_ID, qty, TRADE_SYMBOL)
 
     open_orders = trading_client.get_orders(
         filter=GetOrdersRequest(
             status=QueryOrderStatus.OPEN, symbols=[TRADE_SYMBOL]
         )
     )
-    if open_orders:
+    # Check if open order belongs to this strategy via client_order_id prefix
+    strat_open_orders = [
+        o for o in open_orders if str(o.client_order_id).startswith(STRATEGY_ID)
+    ]
+    if strat_open_orders:
         msg = (
-            f"{len(open_orders)} open {TRADE_SYMBOL} order(s) already pending; "
-            "skipping to avoid duplicates."
+            f"{len(strat_open_orders)} open {TRADE_SYMBOL} order(s) already pending for "
+            f"strategy {STRATEGY_ID}; skipping to avoid duplicates."
         )
         log.warning(msg)
         return msg
@@ -446,10 +458,10 @@ def execute(
             log.info(msg)
             return msg
 
-        amount = round(deployable_cash(account), 2)
+        # Trade amount set directly to hardcoded strategy capital allocation
+        amount = round(STRATEGY_CAPITAL_ALLOCATION, 2)
         log.info(
-            "BUY signal. Deployable cash (%.0f%%): $%.2f",
-            CASH_DEPLOYMENT_PCT * 100,
+            "BUY signal. Deploying full strategy allocation: $%.2f",
             amount,
         )
 
@@ -461,12 +473,13 @@ def execute(
             log.error(msg)
             return msg
 
+        client_order_id = f"{STRATEGY_ID}_BUY_{uuid.uuid4().hex[:8]}"
+
         if dry_run:
-            dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
             msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
-            log.info("%s | Simulated Order ID: %s", msg, dry_id)
+            log.info("%s | Client Order ID: %s", msg, client_order_id)
             exec_logger.log_execution(
-                broker_order_id=dry_id,
+                broker_order_id=client_order_id,
                 symbol=TRADE_SYMBOL,
                 action="BUY",
                 notional_usd=amount,
@@ -483,12 +496,14 @@ def execute(
                 notional=amount,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
+                client_order_id=client_order_id,
             )
         )
         log.info(
-            "Submitted BUY $%.2f %s | id=%s status=%s",
+            "Submitted BUY $%.2f %s | client_id=%s | order_id=%s | status=%s",
             amount,
             TRADE_SYMBOL,
+            client_order_id,
             order.id,
             _status(order),
         )
@@ -520,15 +535,15 @@ def execute(
     # ---- SELL ----
     elif not target_long and qty > 0:
         log.info(
-            "SELL signal. Closing entire %s position (%s shares).", TRADE_SYMBOL, qty
+            "SELL signal. Closing strategy position (%s shares of %s).", qty, TRADE_SYMBOL
         )
+        client_order_id = f"{STRATEGY_ID}_SELL_{uuid.uuid4().hex[:8]}"
 
         if dry_run:
-            dry_id = f"DRY_RUN_ORD_{uuid.uuid4().hex[:8]}"
-            msg = f"[DRY RUN] Would close position in {TRADE_SYMBOL} ({qty} shares)."
-            log.info("%s | Simulated Order ID: %s", msg, dry_id)
+            msg = f"[DRY RUN] Would SELL {qty} shares of {TRADE_SYMBOL}."
+            log.info("%s | Client Order ID: %s", msg, client_order_id)
             exec_logger.log_execution(
-                broker_order_id=dry_id,
+                broker_order_id=client_order_id,
                 symbol=TRADE_SYMBOL,
                 action="SELL",
                 notional_usd=0.0,
@@ -539,42 +554,52 @@ def execute(
             )
             return msg
 
-        order = trading_client.close_position(TRADE_SYMBOL)
+        order = trading_client.submit_order(
+            MarketOrderRequest(
+                symbol=TRADE_SYMBOL,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=client_order_id,
+            )
+        )
         log.info(
-            "Submitted CLOSE %s | id=%s status=%s",
+            "Submitted SELL %s shares %s | client_id=%s | order_id=%s | status=%s",
+            qty,
             TRADE_SYMBOL,
+            client_order_id,
             order.id,
             _status(order),
         )
         if market_open:
             order = wait_for_order(trading_client, order)
             log.info(
-                "CLOSE order status: %s (filled_qty=%s)",
+                "SELL order status: %s (filled_qty=%s)",
                 _status(order),
                 order.filled_qty,
             )
 
-        assert_order_ok(order, "CLOSE")
+        assert_order_ok(order, "SELL")
 
         exec_logger.log_execution(
             broker_order_id=str(order.id),
             symbol=TRADE_SYMBOL,
             action="SELL",
             notional_usd=0.0,
-            qty_shares=qty,
+            qty_shares=float(order.filled_qty or qty),
             status=_status(order),
             dry_run=False,
             reason="Weekly Trend Breakdown / Overbought Signal",
         )
         return (
-            f"SOLD entire {TRADE_SYMBOL} position ({qty} shares) | Order ID:"
+            f"SOLD strategy position of {qty} shares in {TRADE_SYMBOL} | Order ID:"
             f" {order.id} | Status: {_status(order)}"
         )
 
     # ---- HOLD / NO ACTION ----
     else:
         msg = (
-            f"NO ACTION: target is {'LONG' if target_long else 'FLAT'} and position"
+            f"NO ACTION: target is {'LONG' if target_long else 'FLAT'} and strategy position"
             f" is {qty} shares."
         )
         log.info(msg)
@@ -702,8 +727,9 @@ def main(argv: Optional[list] = None) -> int:
 
     paper = not args.live
     log.info(
-        "Starting Strategy [%s] | mode=%s | dry_run=%s",
+        "Starting Strategy [%s] | Capital=$%.2f | mode=%s | dry_run=%s",
         STRATEGY_ID,
+        STRATEGY_CAPITAL_ALLOCATION,
         mode,
         args.dry_run,
     )
@@ -714,7 +740,7 @@ def main(argv: Optional[list] = None) -> int:
         log.error("Invalid ALPACA_FEED (use 'iex' or 'sip').")
         send_email_report(
             f"[{STRATEGY_ID}] ERROR ({run_stamp})",
-            "Invalid ALPACA_FEED env var (use 'iex' or 'sip').",
+            "Invalid ALPACA_FEED env var (use 'sip' or 'iex').",
         )
         return 1
 
@@ -751,6 +777,7 @@ def main(argv: Optional[list] = None) -> int:
 
         indicator_summary = (
             f"Strategy ID: {STRATEGY_ID}\n"
+            f"Strategy Allocation: ${STRATEGY_CAPITAL_ALLOCATION:,.2f}\n"
             f"Week of {week_str}\n"
             f"  Close:         {last['close']:.2f}\n"
             f"  EMA12:         {last['EMA12']:.2f}\n"
