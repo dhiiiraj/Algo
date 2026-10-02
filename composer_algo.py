@@ -54,12 +54,12 @@ STRATEGY_ID = "COMPOSER_ROTATION_V1"  # Unique Strategy ID for trade tracking
 TICKERS = ["TQQQ", "SOXL", "SQQQ", "BSV", "UVXY", "TECL"]
 
 MIN_ROWS = 200  # Minimum daily history bars required for 200-day SMA
-MIN_TRADE_QTY = 0.1  # Self-imposed minimum share quantity floor
+MIN_TRADE_QTY = 10  # Self-imposed minimum share quantity floor
 POSITION_DUST_THRESHOLD = 0.001  # Ignore fractional share residuals
 
 # Target share quantity (overridden by env var STRATEGY_QTY or STRATEGY_CAPITAL if set)
 STRATEGY_QTY_ALLOCATION = float(
-    os.getenv("STRATEGY_QTY", os.getenv("STRATEGY_CAPITAL", "10.0"))
+    os.getenv("STRATEGY_QTY", os.getenv("STRATEGY_CAPITAL", "15.0"))
 )
 
 ET = ZoneInfo("America/New_York")
