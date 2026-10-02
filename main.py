@@ -6,16 +6,8 @@ Signal (computed on COMPLETED weekly QQQ bars only):
     SELL state : EMA12 <= EMA26  OR  (RSI >= 70 AND MACD <= MACD signal)
     Otherwise  : keep the previous state (hysteresis).
 
-Usage:
-    export ALPACA_API_KEY=...
-    export ALPACA_SECRET_KEY=...
-    export GOOGLE_SHEET_ID=...
-    export GOOGLE_CREDENTIALS_B64='ewogICJ0eXBlIjogInNlcnZpY2VfYWNjb3VudCIs...'
-    export STRATEGY_CAPITAL=5000.00          # Dedicated capital for this strategy
-
-    python tqqq_weekly_bot.py --dry-run      # paper account, log decision only
-    python tqqq_weekly_bot.py                # paper account, places orders
-    python tqqq_weekly_bot.py --live         # REAL MONEY, places orders
+Execution:
+    Buys a specified QUANTITY of shares rather than a dollar notional amount.
 """
 
 import argparse
@@ -57,10 +49,12 @@ TRADE_SYMBOL = "TQQQ"
 HISTORY_YEARS = 8  # weekly history to pull (more = better indicator warm-up)
 MIN_BARS = 104  # minimum completed weekly bars required
 
-MIN_TRADE_AMOUNT = 1000.0  # self-imposed floor in USD
+MIN_TRADE_QTY = 1.0  # Self-imposed minimum share quantity floor
 
-# Hardcoded Strategy Capital (overridden by env var STRATEGY_CAPITAL if set)
-STRATEGY_CAPITAL_ALLOCATION = float(os.getenv("STRATEGY_CAPITAL", "5000.00"))
+# Target share quantity (overridden by env var STRATEGY_QTY or STRATEGY_CAPITAL if set)
+STRATEGY_QTY_ALLOCATION = float(
+    os.getenv("STRATEGY_QTY", os.getenv("STRATEGY_CAPITAL", "100.0"))
+)
 
 POSITION_DUST_THRESHOLD = 0.001
 
@@ -125,13 +119,17 @@ class GoogleSheetExecutionLogger:
             creds_dict = json.loads(decoded_json)
 
             if "private_key" in creds_dict:
-                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+                creds_dict["private_key"] = creds_dict["private_key"].replace(
+                    "\\n", "\n"
+                )
 
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+            creds = Credentials.from_service_account_info(
+                creds_dict, scopes=scopes
+            )
             client = gspread.authorize(creds)
             self.worksheet = client.open_by_key(self.sheet_id).sheet1
             self._ensure_headers()
@@ -199,7 +197,9 @@ class GoogleSheetExecutionLogger:
     def get_strategy_position(self, symbol: str) -> float:
         """Calculates net position for THIS strategy using filled logs from Google Sheets."""
         if not self.worksheet:
-            log.warning("Sheet logging disabled; cannot deduce virtual position. Returning 0.0.")
+            log.warning(
+                "Sheet logging disabled; cannot deduce virtual position. Returning 0.0."
+            )
             return 0.0
 
         try:
@@ -211,7 +211,11 @@ class GoogleSheetExecutionLogger:
                 row_status = str(r.get("status", "")).upper()
                 row_action = str(r.get("action", "")).upper()
 
-                if row_strat == STRATEGY_ID and row_symbol == symbol and row_status == "FILLED":
+                if (
+                    row_strat == STRATEGY_ID
+                    and row_symbol == symbol
+                    and row_status == "FILLED"
+                ):
                     try:
                         shares = float(r.get("qty_shares", 0.0))
                     except (ValueError, TypeError):
@@ -291,7 +295,9 @@ def last_complete_week_monday(now_et: datetime) -> date:
         this_monday + timedelta(days=4), WEEK_CLOSE_TIME, tzinfo=ET
     )
     return (
-        this_monday if now_et >= this_week_close else this_monday - timedelta(days=7)
+        this_monday
+        if now_et >= this_week_close
+        else this_monday - timedelta(days=7)
     )
 
 
@@ -387,7 +393,7 @@ def assert_order_ok(order, label: str) -> None:
 
 
 # ==========================================
-# 6. EXECUTION
+# 6. EXECUTION (QUANTITY BASED)
 # ==========================================
 def execute(
     trading_client: TradingClient,
@@ -408,10 +414,6 @@ def execute(
     asset = trading_client.get_asset(TRADE_SYMBOL)
     if not asset.tradable:
         raise StrategyError(f"{TRADE_SYMBOL} is not tradable on this account.")
-    if not asset.fractionable:
-        raise StrategyError(
-            f"{TRADE_SYMBOL} is not fractionable; notional orders unsupported."
-        )
 
     market_open = True
     try:
@@ -423,7 +425,12 @@ def execute(
 
     # 1. Check virtual position tracking specifically for STRATEGY_ID
     qty = exec_logger.get_strategy_position(TRADE_SYMBOL)
-    log.info("Strategy [%s] Tracked Position: %s shares of %s", STRATEGY_ID, qty, TRADE_SYMBOL)
+    log.info(
+        "Strategy [%s] Tracked Position: %s shares of %s",
+        STRATEGY_ID,
+        qty,
+        TRADE_SYMBOL,
+    )
 
     open_orders = trading_client.get_orders(
         filter=GetOrdersRequest(
@@ -448,7 +455,7 @@ def execute(
         fresh_buy,
     )
 
-    # ---- BUY ----
+    # ---- BUY BY QUANTITY ----
     if target_long and qty == 0:
         if ENTER_ONLY_ON_FRESH_BUY and not fresh_buy:
             msg = (
@@ -458,16 +465,15 @@ def execute(
             log.info(msg)
             return msg
 
-        # Trade amount set directly to hardcoded strategy capital allocation
-        amount = round(STRATEGY_CAPITAL_ALLOCATION, 2)
+        buy_qty = round(STRATEGY_QTY_ALLOCATION, 4)
         log.info(
-            "BUY signal. Deploying full strategy allocation: $%.2f",
-            amount,
+            "BUY signal. Submitting order for target share quantity: %s shares",
+            buy_qty,
         )
 
-        if amount < MIN_TRADE_AMOUNT:
+        if buy_qty < MIN_TRADE_QTY:
             msg = (
-                f"Trade amount ${amount:.2f} below minimum ${MIN_TRADE_AMOUNT:.2f};"
+                f"Trade quantity {buy_qty} below minimum threshold {MIN_TRADE_QTY};"
                 " not buying."
             )
             log.error(msg)
@@ -476,14 +482,14 @@ def execute(
         client_order_id = f"{STRATEGY_ID}_BUY_{uuid.uuid4().hex[:8]}"
 
         if dry_run:
-            msg = f"[DRY RUN] Would BUY ${amount:.2f} of {TRADE_SYMBOL}."
+            msg = f"[DRY RUN] Would BUY {buy_qty} shares of {TRADE_SYMBOL}."
             log.info("%s | Client Order ID: %s", msg, client_order_id)
             exec_logger.log_execution(
                 broker_order_id=client_order_id,
                 symbol=TRADE_SYMBOL,
                 action="BUY",
-                notional_usd=amount,
-                qty_shares=0.0,
+                notional_usd=0.0,
+                qty_shares=buy_qty,
                 status="DRY_RUN",
                 dry_run=True,
                 reason="Weekly MACD/EMA Bullish Signal",
@@ -493,20 +499,21 @@ def execute(
         order = trading_client.submit_order(
             MarketOrderRequest(
                 symbol=TRADE_SYMBOL,
-                notional=amount,
+                qty=buy_qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
                 client_order_id=client_order_id,
             )
         )
         log.info(
-            "Submitted BUY $%.2f %s | client_id=%s | order_id=%s | status=%s",
-            amount,
+            "Submitted BUY %s shares of %s | client_id=%s | order_id=%s | status=%s",
+            buy_qty,
             TRADE_SYMBOL,
             client_order_id,
             order.id,
             _status(order),
         )
+
         if market_open:
             order = wait_for_order(trading_client, order)
             log.info(
@@ -517,25 +524,31 @@ def execute(
 
         assert_order_ok(order, "BUY")
 
+        filled_qty = float(order.filled_qty or buy_qty)
+        filled_price = float(order.filled_avg_price or 0.0)
+        est_notional = round(filled_qty * filled_price, 2) if filled_price else 0.0
+
         exec_logger.log_execution(
             broker_order_id=str(order.id),
             symbol=TRADE_SYMBOL,
             action="BUY",
-            notional_usd=amount,
-            qty_shares=float(order.filled_qty or 0.0),
+            notional_usd=est_notional,
+            qty_shares=filled_qty,
             status=_status(order),
             dry_run=False,
             reason="Weekly MACD/EMA Bullish Signal",
         )
         return (
-            f"BUY ${amount:.2f} of {TRADE_SYMBOL} | Order ID: {order.id} | Status:"
-            f" {_status(order)}"
+            f"BUY {filled_qty} shares of {TRADE_SYMBOL} (~${est_notional:.2f}) |"
+            f" Order ID: {order.id} | Status: {_status(order)}"
         )
 
     # ---- SELL ----
     elif not target_long and qty > 0:
         log.info(
-            "SELL signal. Closing strategy position (%s shares of %s).", qty, TRADE_SYMBOL
+            "SELL signal. Closing strategy position (%s shares of %s).",
+            qty,
+            TRADE_SYMBOL,
         )
         client_order_id = f"{STRATEGY_ID}_SELL_{uuid.uuid4().hex[:8]}"
 
@@ -581,19 +594,23 @@ def execute(
 
         assert_order_ok(order, "SELL")
 
+        filled_qty = float(order.filled_qty or qty)
+        filled_price = float(order.filled_avg_price or 0.0)
+        est_notional = round(filled_qty * filled_price, 2) if filled_price else 0.0
+
         exec_logger.log_execution(
             broker_order_id=str(order.id),
             symbol=TRADE_SYMBOL,
             action="SELL",
-            notional_usd=0.0,
-            qty_shares=float(order.filled_qty or qty),
+            notional_usd=est_notional,
+            qty_shares=filled_qty,
             status=_status(order),
             dry_run=False,
             reason="Weekly Trend Breakdown / Overbought Signal",
         )
         return (
-            f"SOLD strategy position of {qty} shares in {TRADE_SYMBOL} | Order ID:"
-            f" {order.id} | Status: {_status(order)}"
+            f"SOLD strategy position of {filled_qty} shares in {TRADE_SYMBOL} |"
+            f" Order ID: {order.id} | Status: {_status(order)}"
         )
 
     # ---- HOLD / NO ACTION ----
@@ -727,9 +744,9 @@ def main(argv: Optional[list] = None) -> int:
 
     paper = not args.live
     log.info(
-        "Starting Strategy [%s] | Capital=$%.2f | mode=%s | dry_run=%s",
+        "Starting Strategy [%s] | Allocation=%s shares | mode=%s | dry_run=%s",
         STRATEGY_ID,
-        STRATEGY_CAPITAL_ALLOCATION,
+        STRATEGY_QTY_ALLOCATION,
         mode,
         args.dry_run,
     )
@@ -777,7 +794,7 @@ def main(argv: Optional[list] = None) -> int:
 
         indicator_summary = (
             f"Strategy ID: {STRATEGY_ID}\n"
-            f"Strategy Allocation: ${STRATEGY_CAPITAL_ALLOCATION:,.2f}\n"
+            f"Target Share Quantity: {STRATEGY_QTY_ALLOCATION} shares\n"
             f"Week of {week_str}\n"
             f"  Close:         {last['close']:.2f}\n"
             f"  EMA12:         {last['EMA12']:.2f}\n"
