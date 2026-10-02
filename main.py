@@ -57,7 +57,7 @@ TRADE_SYMBOL = "TQQQ"
 HISTORY_YEARS = 8  # weekly history to pull (more = better indicator warm-up)
 MIN_BARS = 104  # minimum completed weekly bars required
 
-MIN_TRADE_AMOUNT = 1000.0  # self-imposed floor in USD
+MIN_TRADE_AMOUNT = 10000.0  # self-imposed floor in USD
 
 # Hardcoded Strategy Capital (overridden by env var STRATEGY_CAPITAL if set)
 STRATEGY_CAPITAL_ALLOCATION = float(os.getenv("STRATEGY_CAPITAL", "5000.00"))
