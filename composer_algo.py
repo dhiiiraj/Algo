@@ -1,3 +1,4 @@
+"""
 #!/usr/bin/env python3
 """Multi-Asset Rotation Bot (Alpaca) with Google Sheets Execution Logging & Virtual Strategy Tracking.
 
@@ -654,3 +655,5 @@ if __name__ == "__main__":
             )
             send_email_report(f"[{STRATEGY_ID}] ERROR - {run_stamp}", body)
         raise
+
+        """
