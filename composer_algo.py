@@ -49,7 +49,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 # ==========================================
 # 1. CONFIGURATION & CREDENTIALS
 # ==========================================
-STRATEGY_ID = "COMPOSER_ROTATION_V1"  # Unique Strategy ID for trade tracking
+STRATEGY_ID = "COMPOSER_V1"  # Unique Strategy ID for trade tracking
 
 TICKERS = ["TQQQ", "SOXL", "SQQQ", "BSV", "UVXY", "TECL"]
 
