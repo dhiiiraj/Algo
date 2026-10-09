@@ -41,7 +41,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-STRATEGY_ID = "QQQ_MACD_WEEKLY_V1"  # Unique Strategy ID for trade tracking
+STRATEGY_ID = "TQQQ_Dhiraj_V1"  # Unique Strategy ID for trade tracking
 
 INDICATOR_SYMBOL = "QQQ"
 TRADE_SYMBOL = "TQQQ"
