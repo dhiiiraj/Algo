@@ -494,10 +494,11 @@ def rebalance(
         log.warning(msg)
         return msg
 
-    # 3. Check if already properly allocated
+# 3. Check if already properly allocated
     current_target_qty = active_positions.get(target_ticker, 0.0)
     if current_target_qty > POSITION_DUST_THRESHOLD and len(active_positions) == 1:
-        msg = f"NO ACTION: Already holding target asset ({target_ticker}: {current_target_qty} shares)."
+        # Changed message here:
+        msg = "No action taken as trend intact"
         log.info(msg)
         hold_id = f"HOLD_{uuid.uuid4().hex[:8]}"
         exec_logger.log_execution(
