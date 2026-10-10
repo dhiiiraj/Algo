@@ -180,7 +180,7 @@ class GoogleSheetExecutionLogger:
                 action.upper(),
                 round(notional_usd, 2) if notional_usd else 0.0,
                 round(qty_shares, 4) if qty_shares else 0.0,
-                status,
+                str(status).upper(),
                 dry_run,
                 reason,
             ]
@@ -208,13 +208,16 @@ class GoogleSheetExecutionLogger:
             for r in records:
                 row_strat = str(r.get("strategy_id", "")).strip()
                 row_symbol = str(r.get("symbol", "")).strip()
-                row_status = str(r.get("status", "")).upper()
-                row_action = str(r.get("action", "")).upper()
+                row_status = str(r.get("status", "")).strip().upper()
+                row_action = str(r.get("action", "")).strip().upper()
+
+                # Flexible status match for any filled/done string variations
+                is_filled = "FILLED" in row_status or row_status in {"DONE", "EXECUTED"}
 
                 if (
                     row_strat == STRATEGY_ID
                     and row_symbol == symbol
-                    and row_status == "FILLED"
+                    and is_filled
                 ):
                     try:
                         shares = float(r.get("qty_shares", 0.0))
@@ -425,6 +428,16 @@ def execute(
 
     # 1. Check virtual position tracking specifically for STRATEGY_ID
     qty = exec_logger.get_strategy_position(TRADE_SYMBOL)
+
+    # Safety fallback check: Query broker directly if virtual position calculation is zero
+    if qty <= POSITION_DUST_THRESHOLD and target_long:
+        try:
+            pos = trading_client.get_open_position(TRADE_SYMBOL)
+            qty = float(pos.qty)
+            log.info("Found %s shares of %s directly in Alpaca account.", qty, TRADE_SYMBOL)
+        except Exception:
+            pass
+
     log.info(
         "Strategy [%s] Tracked Position: %s shares of %s",
         STRATEGY_ID,
