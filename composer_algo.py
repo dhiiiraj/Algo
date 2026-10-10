@@ -180,7 +180,7 @@ class GoogleSheetExecutionLogger:
                 action.upper(),
                 round(notional_usd, 2) if notional_usd else 0.0,
                 round(qty_shares, 4) if qty_shares else 0.0,
-                status,
+                str(status).upper(),
                 dry_run,
                 reason,
             ]
@@ -208,13 +208,16 @@ class GoogleSheetExecutionLogger:
             for r in records:
                 row_strat = str(r.get("strategy_id", "")).strip()
                 row_symbol = str(r.get("symbol", "")).strip()
-                row_status = str(r.get("status", "")).upper()
-                row_action = str(r.get("action", "")).upper()
+                row_status = str(r.get("status", "")).strip().upper()
+                row_action = str(r.get("action", "")).strip().upper()
+
+                # Flexible status match for any filled/done string variations
+                is_filled = "FILLED" in row_status or row_status in {"DONE", "EXECUTED"}
 
                 if (
                     row_strat == STRATEGY_ID
                     and row_symbol == symbol
-                    and row_status == "FILLED"
+                    and is_filled
                 ):
                     try:
                         shares = float(r.get("qty_shares", 0.0))
@@ -494,10 +497,18 @@ def rebalance(
         log.warning(msg)
         return msg
 
-# 3. Check if already properly allocated
+    # 3. Check if already properly allocated (with Alpaca broker account fallback safety check)
     current_target_qty = active_positions.get(target_ticker, 0.0)
-    if current_target_qty > POSITION_DUST_THRESHOLD and len(active_positions) == 1:
-        # Changed message here:
+
+    if current_target_qty <= POSITION_DUST_THRESHOLD:
+        try:
+            pos = trading_client.get_open_position(target_ticker)
+            current_target_qty = float(pos.qty)
+            log.info("Found %s shares of %s directly in Alpaca account.", current_target_qty, target_ticker)
+        except Exception:
+            pass
+
+    if current_target_qty > POSITION_DUST_THRESHOLD and len(active_positions) <= 1:
         msg = "No action taken as trend intact"
         log.info(msg)
         hold_id = f"HOLD_{uuid.uuid4().hex[:8]}"
