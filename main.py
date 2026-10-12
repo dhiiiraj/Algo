@@ -430,13 +430,6 @@ def execute(
     qty = exec_logger.get_strategy_position(TRADE_SYMBOL)
 
     # Safety fallback check: Query broker directly if virtual position calculation is zero
-    if qty <= POSITION_DUST_THRESHOLD and target_long:
-        try:
-            pos = trading_client.get_open_position(TRADE_SYMBOL)
-            qty = float(pos.qty)
-            log.info("Found %s shares of %s directly in Alpaca account.", qty, TRADE_SYMBOL)
-        except Exception:
-            pass
 
     log.info(
         "Strategy [%s] Tracked Position: %s shares of %s",
