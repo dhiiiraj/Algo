@@ -500,7 +500,7 @@ def rebalance(
     # 3. Check if already properly allocated (with Alpaca broker account fallback safety check)
     current_target_qty = active_positions.get(target_ticker, 0.0)
 
-        if current_target_qty > POSITION_DUST_THRESHOLD and len(active_positions) <= 1:
+    if current_target_qty > POSITION_DUST_THRESHOLD and len(active_positions) <= 1:
         msg = "No action taken as trend intact"
         log.info(msg)
         hold_id = f"HOLD_{uuid.uuid4().hex[:8]}"
