@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 .env
 trade_log.db
+trade_log.csv

@@ -1,3 +1,4 @@
+import csv
 import logging
 import os
 import sqlite3
@@ -9,6 +10,21 @@ DEFAULT_DUST_THRESHOLD = 0.001
 DEFAULT_DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trade_log.db"
 )
+DEFAULT_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trade_log.csv"
+)
+CSV_HEADERS = [
+    "timestamp_utc",
+    "strategy_id",
+    "broker_order_id",
+    "symbol",
+    "action",
+    "notional_usd",
+    "qty_shares",
+    "status",
+    "dry_run",
+    "reason",
+]
 
 
 class SQLiteExecutionLogger:
@@ -18,6 +34,11 @@ class SQLiteExecutionLogger:
     signatures, backed by a local SQLite file instead of a remote sheet. Each
     row is tagged with ``strategy_id`` so several strategies can share one
     Alpaca account and still compute their own positions independently.
+
+    SQLite is the source of truth used for position math, but every write
+    also re-exports the full history to a plain CSV file (``trade_log.csv``)
+    so anyone can just double-click it open in Excel/Numbers/Google Sheets
+    without needing to run a query.
     """
 
     def __init__(
@@ -26,6 +47,7 @@ class SQLiteExecutionLogger:
         self.strategy_id = strategy_id
         self.dust_threshold = dust_threshold
         self.db_path = os.getenv("TRADE_LOG_DB_PATH", DEFAULT_DB_PATH)
+        self.csv_path = os.getenv("TRADE_LOG_CSV_PATH", DEFAULT_CSV_PATH)
 
         try:
             self.conn = sqlite3.connect(self.db_path)
@@ -97,8 +119,22 @@ class SQLiteExecutionLogger:
                 self.strategy_id,
                 broker_order_id,
             )
+            self._export_csv()
         except sqlite3.Error as e:
             log.error("Failed to append trade record to local trade log: %s", e)
+
+    def _export_csv(self):
+        """Overwrites trade_log.csv with the full history, newest first."""
+        try:
+            rows = self.conn.execute(
+                f"SELECT {', '.join(CSV_HEADERS)} FROM executions ORDER BY id DESC"
+            ).fetchall()
+            with open(self.csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(CSV_HEADERS)
+                writer.writerows(rows)
+        except (sqlite3.Error, OSError) as e:
+            log.warning("Could not refresh trade_log.csv: %s", e)
 
     def get_strategy_position(self, symbol: str) -> float:
         """Calculates net position for THIS strategy using filled logs in the DB."""
