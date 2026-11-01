@@ -12,6 +12,10 @@ Algorithms are registered in algorithm/__init__.py.
 import argparse
 import sys
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from algorithm import STRATEGIES
 from engine.runner import add_mode_args, run_strategy
 
