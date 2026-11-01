@@ -1,7 +1,5 @@
 alpaca-py>=0.44.0
 pandas>=2.0.0
 numpy>=1.24.0
-gspread>=6.0.0
-google-auth>=2.0.0
 exchange_calendars
 python-dotenv>=1.0.0
