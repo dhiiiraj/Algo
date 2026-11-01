@@ -1,8 +1,9 @@
 """Shared trade executor: moves a strategy from its current positions to its target.
 
 Rules (same for every strategy):
-    * Positions come from the Google Sheet, tagged by strategy_id, so several
-      strategies can share one Alpaca account without touching each other.
+    * Positions come from the local trade log, tagged by strategy_id, so
+      several strategies can share one Alpaca account without touching each
+      other.
     * If this strategy already has open orders, do nothing (avoid duplicates).
     * Sell every held symbol that is not in the target.
     * Buy every target symbol that is not held. Symbols already held are kept
@@ -28,13 +29,13 @@ from alpaca_broker.orders import (
     submit_market_order,
     wait_for_order,
 )
-from google_sheets import GoogleSheetExecutionLogger
+from trade_log import SQLiteExecutionLogger
 
 log = logging.getLogger("algo.executor")
 
 
 def get_active_positions(
-    strategy: Strategy, exec_logger: GoogleSheetExecutionLogger
+    strategy: Strategy, exec_logger: SQLiteExecutionLogger
 ) -> dict[str, float]:
     positions = exec_logger.get_all_strategy_positions(strategy.universe)
     return {s: q for s, q in positions.items() if q > strategy.dust_threshold}
@@ -43,7 +44,7 @@ def get_active_positions(
 def _trade(
     strategy: Strategy,
     trading_client: TradingClient,
-    exec_logger: GoogleSheetExecutionLogger,
+    exec_logger: SQLiteExecutionLogger,
     symbol: str,
     qty: float,
     side: OrderSide,
@@ -115,7 +116,7 @@ def execute_decision(
     strategy: Strategy,
     decision: Decision,
     trading_client: TradingClient,
-    exec_logger: GoogleSheetExecutionLogger,
+    exec_logger: SQLiteExecutionLogger,
     dry_run: bool,
     active_positions: Optional[dict[str, float]] = None,
 ) -> str:

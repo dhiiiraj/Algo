@@ -16,7 +16,7 @@ from common.logging_setup import setup_logging
 from common.market_calendar import ET, is_market_open_today
 from common.notifications import send_email_report
 from engine.executor import execute_decision, get_active_positions
-from google_sheets import GoogleSheetExecutionLogger
+from trade_log import SQLiteExecutionLogger
 
 log = logging.getLogger("algo.runner")
 
@@ -47,7 +47,7 @@ def run_strategy(strategy: Strategy, live: bool, dry_run: bool) -> int:
         )
         return 0
 
-    exec_logger = GoogleSheetExecutionLogger(sid, strategy.dust_threshold)
+    exec_logger = SQLiteExecutionLogger(sid, strategy.dust_threshold)
     mode = "PAPER" if not live else "*** LIVE ***"
     run_stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
 
