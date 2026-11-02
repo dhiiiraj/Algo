@@ -3,6 +3,37 @@
 This runs trading strategies against your Alpaca **paper trading** account
 (fake money — safe to test with). Follow these steps exactly, in order.
 
+## First-time setup (only needed once, or on a new machine)
+
+1. Open the **Terminal** app and move into the project folder:
+   ```
+   cd /Users/test/Desktop/algo/Algo
+   ```
+2. Create the project's virtual environment (a private folder of Python
+   tools just for this project):
+   ```
+   python3 -m venv .venv
+   ```
+3. Turn it on:
+   ```
+   source .venv/bin/activate
+   ```
+4. Install everything the project needs:
+   ```
+   pip install -r requirements.txt
+   ```
+5. Create a file named `.env` in this same folder with your Alpaca paper
+   trading keys:
+   ```
+   ALPACA_API_KEY=your_key_here
+   ALPACA_SECRET_KEY=your_secret_here
+   ```
+   (Get these from your Alpaca account's **paper trading** API keys page —
+   never your live account keys.)
+
+Once this is done, you don't need to repeat it — skip straight to "Every
+time you want to run it" below from now on.
+
 ## Every time you want to run it
 
 1. Open the **Terminal** app.
