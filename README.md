@@ -27,8 +27,17 @@ This runs trading strategies against your Alpaca **paper trading** account
    ```
    python run.py composer_rotation --dry-run
    ```
+6. To actually place the trade (still paper/fake money, just a real order
+   this time):
+   ```
+   python run.py tqqq_weekly
+   ```
+   or
+   ```
+   python run.py composer_rotation
+   ```
 
-That's it — steps 2 and 3 are needed once per Terminal window; step 4/5 is
+That's it — steps 2 and 3 are needed once per Terminal window; step 4-6 is
 whatever you actually want to run.
 
 ## Where to see what happened
